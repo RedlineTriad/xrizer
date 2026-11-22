@@ -248,7 +248,7 @@ impl Fixture {
             vr::EVRInputError::None
         );
         if self.pending_profile_change {
-            self.input.openxr.poll_events();
+            self.input.openxr.poll_events().unwrap();
             self.pending_profile_change = false;
         }
     }
@@ -299,7 +299,7 @@ impl Fixture {
         handle: vr::VRActionHandle_t,
         restrict: vr::VRInputValueHandle_t,
     ) -> Result<vr::InputPoseActionData_t, vr::EVRInputError> {
-        self.input.openxr.poll_events();
+        self.input.openxr.poll_events().unwrap();
         let mut state = Default::default();
         let err = self.input.GetPoseActionDataForNextFrame(
             handle,
@@ -458,7 +458,7 @@ fn reload_manifest_on_session_restart() {
     let boolact = f.get_action_handle(c"/actions/set1/in/boolact");
 
     f.load_actions(c"actions.json");
-    f.input.openxr.restart_session();
+    f.input.openxr.restart_session().unwrap();
 
     fakexr::set_action_state(
         f.get_action::<bool>(boolact),
@@ -508,7 +508,7 @@ fn raw_pose_waitgetposes_and_skeletal_pose_identical() {
     f.set_interaction_profile::<Knuckles>(LeftHand);
 
     let frame = || {
-        f.input.openxr.poll_events();
+        f.input.openxr.poll_events().unwrap();
         f.input.frame_start_update();
     };
 
@@ -807,7 +807,7 @@ fn raw_pose_switch_profile() {
     f.set_interaction_profile::<OculusTouch>(RightHand);
 
     // Cached poses don't reset until next frame
-    f.input.openxr.poll_events();
+    f.input.openxr.poll_events().unwrap();
     f.input.frame_start_update();
 
     f.sync(vr::VRActiveActionSet_t {
@@ -1002,7 +1002,7 @@ fn detect_controller_after_manifest_load() {
 
     let input = f.input.clone();
     let frame = || {
-        input.openxr.poll_events();
+        input.openxr.poll_events().unwrap();
         input.frame_start_update();
     };
 
@@ -1025,21 +1025,21 @@ fn empty_manifest() {
     f.input
         .SetActionManifestPath(c"empty_manifest.json".as_ptr() as _);
 
-    f.input.openxr.restart_session();
+    f.input.openxr.restart_session().unwrap();
     assert!(f.input.action_map.read().unwrap().is_empty());
 }
 
 #[test]
 fn load_actions_race() {
     let mut f = Fixture::new();
-    f.input.openxr.restart_session(); // get to real session
+    f.input.openxr.restart_session().unwrap(); // get to real session
 
     f.set_interaction_profile::<OculusTouch>(LeftHand);
     f.set_interaction_profile::<OculusTouch>(RightHand);
 
     let mut f = Arc::new(f);
     f.input.frame_start_update(); // load legacy
-    f.input.openxr.poll_events();
+    f.input.openxr.poll_events().unwrap();
     let got_input = f.input.get_legacy_controller_state(
         1,
         &mut vr::VRControllerState_t::default(),

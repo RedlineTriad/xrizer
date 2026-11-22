@@ -1193,6 +1193,9 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
     }
 
     fn SetActionManifestPath(&self, path: *const c_char) -> vr::EVRInputError {
+        if self.openxr.is_runtime_lost() {
+            return vr::EVRInputError::IPCError;
+        }
         if path.is_null() {
             return vr::EVRInputError::InvalidParam;
         }
@@ -1205,7 +1208,11 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
         let mut data = self.openxr.session_data.get();
         if data.input_data.get_legacy_actions().is_some() {
             drop(data);
-            self.openxr.restart_session();
+            if let Err(error) = self.openxr.restart_session() {
+                debug!("OpenXR session restart failed: {error:?}");
+                self.loading_actions.store(false, Ordering::Relaxed);
+                return vr::EVRInputError::IPCError;
+            }
             data = self.openxr.session_data.get();
         }
 
@@ -1347,7 +1354,7 @@ impl<C: openxr_data::Compositor> vr::IVRInput004On005 for Input<C> {
 }
 
 impl<C: openxr_data::Compositor> Input<C> {
-    pub fn interaction_profile_changed(&self, session_data: &SessionData) {
+    pub fn interaction_profile_changed(&self, session_data: &SessionData) -> xr::Result<()> {
         let mut devices = session_data.input_data.devices.write().unwrap();
 
         let mut devices_to_create = vec![];
@@ -1358,8 +1365,7 @@ impl<C: openxr_data::Compositor> Input<C> {
 
             let profile_path = session_data
                 .session
-                .current_interaction_profile(subaction_path)
-                .unwrap();
+                .current_interaction_profile(subaction_path)?;
 
             if let Some(controller) = controller.as_mut() {
                 controller.profile_path = profile_path;
@@ -1376,7 +1382,7 @@ impl<C: openxr_data::Compositor> Input<C> {
                     if let Some(controller) = controller.as_mut() {
                         controller.connected = true;
                     }
-                    self.openxr.instance.path_to_string(path).unwrap()
+                    self.openxr.instance.path_to_string(path)?
                 }
             };
 
@@ -1439,8 +1445,7 @@ impl<C: openxr_data::Compositor> Input<C> {
                 "{} interaction profile changed: {}",
                 self.openxr
                     .instance
-                    .path_to_string(self.get_subaction_path(hand))
-                    .unwrap(),
+                    .path_to_string(self.get_subaction_path(hand))?,
                 profile_name
             )
         }
@@ -1455,9 +1460,8 @@ impl<C: openxr_data::Compositor> Input<C> {
         }
 
         #[cfg(feature = "monado")]
-        devices
-            .create_monado_generic_trackers(&self.openxr, session_data)
-            .unwrap();
+        devices.create_monado_generic_trackers(&self.openxr, session_data)?;
+        Ok(())
     }
 
     pub fn frame_start_update(&self) {

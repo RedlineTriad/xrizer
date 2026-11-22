@@ -1008,7 +1008,7 @@ mod tests {
         let boolact = f.get_action_handle(c"/actions/set1/in/boolact");
 
         f.load_actions(c"actions_dpad.json");
-        f.input.openxr.restart_session();
+        f.input.openxr.restart_session().unwrap();
 
         get_dpad_action!(f, boolact, dpad_data, ViveWands);
 
@@ -1082,7 +1082,7 @@ mod tests {
         let boolact = f.get_action_handle(c"/actions/set1/in/boolact");
 
         f.load_actions(c"actions_dpad_mixed.json");
-        f.input.openxr.restart_session();
+        f.input.openxr.restart_session().unwrap();
 
         get_dpad_action!(f, boolact, _dpad, ViveWands);
 
@@ -1119,7 +1119,7 @@ mod tests {
         let boolact = f.get_action_handle(c"/actions/set1/in/boolact");
 
         f.load_actions(c"actions_dpad_multi.json");
-        f.input.openxr.restart_session();
+        f.input.openxr.restart_session().unwrap();
 
         get_dpad_action!(f, boolact, dpad_data_vive, ViveWands);
         get_dpad_action!(f, boolact, dpad_data_knuckles, Knuckles);

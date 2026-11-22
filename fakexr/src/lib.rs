@@ -164,6 +164,27 @@ pub fn session_frame_state(session: xr::Session) -> FrameState {
     session.frame_state.load()
 }
 
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+pub enum SessionCall {
+    RequestExit,
+}
+
+pub fn fail_next_session_call(
+    session: xr::Session,
+    call: SessionCall,
+    result: xr::Result,
+) -> Arc<AtomicBool> {
+    let called = Arc::new(AtomicBool::new(false));
+    let session = session.to_handle().unwrap();
+    let previous = session
+        .next_error
+        .lock()
+        .unwrap()
+        .replace((call, result, called.clone()));
+    assert!(previous.is_none());
+    called
+}
+
 macro_rules! fn_unimplemented_impl {
     ($($param:ident),+) => {
         fn_unimplemented_impl!($($param),+  -> []);
@@ -542,9 +563,20 @@ struct Session {
     should_render: AtomicBool,
     frame_state: AtomicCell<FrameState>,
     with_trackers: AtomicBool,
+    next_error: Mutex<Option<(SessionCall, xr::Result, Arc<AtomicBool>)>>,
 }
 
 impl Session {
+    fn take_error(&self, call: SessionCall) -> Option<xr::Result> {
+        let mut next = self.next_error.lock().unwrap();
+        if next.as_ref().is_some_and(|(target, _, _)| *target == call) {
+            let (_, result, called) = next.take().unwrap();
+            called.store(true, Ordering::Relaxed);
+            return Some(result);
+        }
+        None
+    }
+
     fn synchronized(self: &Arc<Self>) {
         self.state.store(xr::SessionState::SYNCHRONIZED);
         let session = Self::instances()
@@ -885,6 +917,7 @@ extern "system" fn create_session(
         state_synced: true.into(),
         should_render: false.into(),
         frame_state: FrameState::Ended.into(),
+        next_error: Mutex::default(),
         with_trackers: false.into(),
     });
 
@@ -1212,6 +1245,9 @@ extern "system" fn path_to_string(
 
 extern "system" fn request_exit_session(session: xr::Session) -> xr::Result {
     let sess = get_handle!(session);
+    if let Some(error) = sess.take_error(SessionCall::RequestExit) {
+        return error;
+    }
     send_event(
         &sess.event_sender,
         xr::EventDataSessionStateChanged {

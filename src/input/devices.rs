@@ -617,7 +617,7 @@ mod tests {
         fakexr::add_trackers(f.input.openxr.session_data.get().session.as_raw());
 
         let frame = || {
-            f.input.openxr.poll_events();
+            f.input.openxr.poll_events().unwrap();
             f.input.frame_start_update();
         };
 
@@ -645,7 +645,7 @@ mod tests {
         fakexr::add_trackers(f.input.openxr.session_data.get().session.as_raw());
 
         let frame = || {
-            f.input.openxr.poll_events();
+            f.input.openxr.poll_events().unwrap();
             f.input.frame_start_update();
         };
 

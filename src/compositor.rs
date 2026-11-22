@@ -183,8 +183,20 @@ impl Compositor {
         *self.tmp_backend.lock().unwrap() = Some(tmp_backend);
 
         info!("Creating real backend for texture type {:?}", texture.eType);
-        self.openxr.restart_session();
-        Ok(())
+        self.openxr.restart_session().map_err(|error| {
+            debug!("OpenXR session restart failed: {error:?}");
+            self.tmp_backend.lock().unwrap().take();
+            vr::EVRCompositorError::RequestFailed
+        })
+    }
+}
+
+fn clear_poses(poses: *mut vr::TrackedDevicePose_t, count: u32) {
+    if !poses.is_null() {
+        let invalid = vr::space_relation_to_openvr_pose(Default::default(), Default::default());
+        for index in 0..count as usize {
+            unsafe { poses.add(index).write(invalid) };
+        }
     }
 }
 
@@ -349,7 +361,9 @@ impl vr::IVRCompositor029_Interface for Compositor {
         todo!()
     }
     fn SubmitExplicitTimingData(&self) -> vr::EVRCompositorError {
-        if *self.timing_mode.lock().unwrap() == vr::EVRCompositorTimingMode::Implicit {
+        if self.openxr.is_runtime_lost()
+            || *self.timing_mode.lock().unwrap() == vr::EVRCompositorTimingMode::Implicit
+        {
             return vr::EVRCompositorError::RequestFailed;
         }
 
@@ -645,6 +659,10 @@ impl vr::IVRCompositor029_Interface for Compositor {
         true
     }
     fn PostPresentHandoff(&self) {
+        if self.openxr.is_runtime_lost() {
+            return;
+        }
+
         #[macros::any_graphics(DynFrameController)]
         fn end_frame<G: GraphicsBackend + 'static>(
             ctrl: &mut FrameController<G>,
@@ -730,6 +748,9 @@ impl vr::IVRCompositor029_Interface for Compositor {
         bounds: *const vr::VRTextureBounds_t,
         submit_flags: vr::EVRSubmitFlags,
     ) -> vr::EVRCompositorError {
+        if self.openxr.is_runtime_lost() {
+            return vr::EVRCompositorError::RequestFailed;
+        }
         let bounds = unsafe { bounds.as_ref() }
             .copied()
             .unwrap_or(vr::VRTextureBounds_t {
@@ -816,6 +837,11 @@ impl vr::IVRCompositor029_Interface for Compositor {
         output_pose: *mut vr::TrackedDevicePose_t,
         output_game_pose: *mut vr::TrackedDevicePose_t,
     ) -> vr::EVRCompositorError {
+        if self.openxr.is_runtime_lost() {
+            clear_poses(output_pose, 1);
+            clear_poses(output_game_pose, 1);
+            return vr::EVRCompositorError::RequestFailed;
+        }
         if output_pose.is_null() && output_game_pose.is_null() {
             return vr::EVRCompositorError::RequestFailed;
         }
@@ -844,6 +870,11 @@ impl vr::IVRCompositor029_Interface for Compositor {
         game_pose_count: u32,
     ) -> vr::EVRCompositorError {
         tracy_span!("GetLastPoses impl");
+        if self.openxr.is_runtime_lost() {
+            clear_poses(render_pose_array, render_pose_count);
+            clear_poses(game_pose_array, game_pose_count);
+            return vr::EVRCompositorError::RequestFailed;
+        }
         if render_pose_count == 0 {
             return vr::EVRCompositorError::None;
         }
@@ -875,8 +906,12 @@ impl vr::IVRCompositor029_Interface for Compositor {
         game_pose_count: u32,
     ) -> vr::EVRCompositorError {
         tracy_span!("WaitGetPoses impl");
-        // This should be called every frame - we must regularly poll events
-        self.openxr.poll_events();
+        // This should be called every frame - we must regularly poll events.
+        if self.openxr.is_runtime_lost() || self.openxr.poll_events().is_err() {
+            clear_poses(render_pose_array, render_pose_count);
+            clear_poses(game_pose_array, game_pose_count);
+            return vr::EVRCompositorError::RequestFailed;
+        }
         self.focused.call_once(|| {});
         {
             let session_data = self.openxr.session_data.get();
@@ -1938,7 +1973,7 @@ mod tests {
         );
 
         f.ensure_real_session(true);
-        f.comp.openxr.restart_session();
+        f.comp.openxr.restart_session().unwrap();
         assert_eq!(f.wait_get_poses(), None);
 
         f.check_frame_state(fakexr::FrameState::Waited);
