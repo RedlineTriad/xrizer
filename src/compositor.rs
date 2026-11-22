@@ -234,7 +234,7 @@ impl Compositor {
             system.reset_views()?;
         }
         if let Some(input) = self.input.get() {
-            input.frame_start_update();
+            input.frame_start_update()?;
         }
         Ok(())
     }

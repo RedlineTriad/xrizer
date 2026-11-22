@@ -618,7 +618,7 @@ mod tests {
 
         let frame = || {
             f.input.openxr.poll_events().unwrap();
-            f.input.frame_start_update();
+            f.input.frame_start_update().unwrap();
         };
 
         // we need to wait two frames for the tracker to be connected.
@@ -646,7 +646,7 @@ mod tests {
 
         let frame = || {
             f.input.openxr.poll_events().unwrap();
-            f.input.frame_start_update();
+            f.input.frame_start_update().unwrap();
         };
 
         // we need to wait two frames for the tracker to be connected.

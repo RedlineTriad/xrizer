@@ -1014,6 +1014,9 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
         active_set_size: u32,
         active_set_count: u32,
     ) -> vr::EVRInputError {
+        if self.openxr.is_runtime_lost() {
+            return vr::EVRInputError::IPCError;
+        }
         // alyx, portal 2 ce
         if active_set_count == 0 || active_set_size == 0 {
             return vr::EVRInputError::NoActiveActionSet;
@@ -1059,13 +1062,12 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
             ));
             sync_sets.push(xr::ActiveActionSet::new(&skeletal_input.set));
             sync_sets.push(xr::ActiveActionSet::new(&actions.haptic_set));
-            self.legacy_state.on_action_sync();
         }
 
-        {
-            tracy_span!("xrSyncActions");
-            data.session.sync_actions(&sync_sets).unwrap();
+        if self.sync_actions(&data, &sync_sets).is_err() {
+            return vr::EVRInputError::IPCError;
         }
+        self.legacy_state.on_action_sync();
 
         let devices = data.input_data.devices.read().unwrap();
         let left_profile = devices
@@ -1464,7 +1466,18 @@ impl<C: openxr_data::Compositor> Input<C> {
         Ok(())
     }
 
-    pub fn frame_start_update(&self) {
+    fn sync_actions(
+        &self,
+        data: &SessionData,
+        action_sets: &[xr::ActiveActionSet],
+    ) -> xr::Result<()> {
+        tracy_span!("xrSyncActions");
+        self.openxr
+            .check_xr("action sync", data.session.sync_actions(action_sets))
+            .map(|_| ())
+    }
+
+    pub fn frame_start_update(&self) -> xr::Result<()> {
         tracy_span!();
         let data = self.openxr.session_data.get();
         let devices = data.input_data.devices.read().unwrap();
@@ -1487,27 +1500,25 @@ impl<C: openxr_data::Compositor> Input<C> {
                 && (right_hand.is_none_or(|hand| !hand.connected))
             {
                 debug!("no controllers connected - syncing info set");
-                data.session
-                    .sync_actions(&[xr::ActiveActionSet::new(&loaded.info_set)])
-                    .unwrap();
+                return self.sync_actions(&data, &[xr::ActiveActionSet::new(&loaded.info_set)]);
             }
-            return;
+            return Ok(());
         }
 
         match input_data.get_legacy_actions() {
             Some(actions) => {
-                data.session
-                    .sync_actions(&[
+                self.sync_actions(
+                    &data,
+                    &[
                         xr::ActiveActionSet::new(&actions.set),
                         xr::ActiveActionSet::new(&input_data.pose_data.get().unwrap().set),
-                    ])
-                    .unwrap();
-
+                    ],
+                )?;
                 self.legacy_state.on_action_sync();
             }
             None => {
                 if self.loading_actions.load(Ordering::Relaxed) {
-                    return;
+                    return Ok(());
                 }
 
                 // If we haven't created our legacy actions yet but we're getting our per frame
@@ -1527,11 +1538,12 @@ impl<C: openxr_data::Compositor> Input<C> {
                     debug!(
                         "Couldn't set up legacy actions because we're not in the real session yet."
                     );
-                    return;
+                    return Ok(());
                 }
                 self.setup_legacy_actions();
             }
         }
+        Ok(())
     }
 
     pub fn post_session_restart(&self, data: &SessionData) {

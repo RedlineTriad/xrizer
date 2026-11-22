@@ -362,6 +362,30 @@ impl Fixture {
 }
 
 #[test]
+fn action_sync_reports_runtime_loss() {
+    let f = Fixture::new();
+    f.load_actions(c"actions.json");
+    let mut active = vr::VRActiveActionSet_t {
+        ulActionSet: f.get_action_set_handle(c"/actions/set1"),
+        ..Default::default()
+    };
+    let session = f.input.openxr.session_data.get().session.as_raw();
+    fakexr::fail_next_session_call(
+        session,
+        fakexr::SessionCall::SyncActions,
+        xr::sys::Result::ERROR_SESSION_LOST,
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            f.input
+                .UpdateActionState(&mut active, std::mem::size_of_val(&active) as u32, 1),
+            vr::EVRInputError::IPCError
+        );
+    }
+    assert!(f.input.openxr.is_runtime_lost());
+}
+
+#[test]
 fn unknown_handles() {
     let f = Fixture::new();
     f.load_actions(c"actions.json");
@@ -509,7 +533,7 @@ fn raw_pose_waitgetposes_and_skeletal_pose_identical() {
 
     let frame = || {
         f.input.openxr.poll_events().unwrap();
-        f.input.frame_start_update();
+        f.input.frame_start_update().unwrap();
     };
 
     // we need to wait two frames for the controller to be connected.
@@ -808,7 +832,7 @@ fn raw_pose_switch_profile() {
 
     // Cached poses don't reset until next frame
     f.input.openxr.poll_events().unwrap();
-    f.input.frame_start_update();
+    f.input.frame_start_update().unwrap();
 
     f.sync(vr::VRActiveActionSet_t {
         ulActionSet: set1,
@@ -1003,7 +1027,7 @@ fn detect_controller_after_manifest_load() {
     let input = f.input.clone();
     let frame = || {
         input.openxr.poll_events().unwrap();
-        input.frame_start_update();
+        input.frame_start_update().unwrap();
     };
 
     frame();
@@ -1038,7 +1062,7 @@ fn load_actions_race() {
     f.set_interaction_profile::<OculusTouch>(RightHand);
 
     let mut f = Arc::new(f);
-    f.input.frame_start_update(); // load legacy
+    f.input.frame_start_update().unwrap(); // load legacy
     f.input.openxr.poll_events().unwrap();
     let got_input = f.input.get_legacy_controller_state(
         1,
@@ -1056,7 +1080,7 @@ fn load_actions_race() {
                 barrier.wait();
                 // arbitrary delay, so we get the frame start update right after restart
                 std::thread::sleep(std::time::Duration::from_micros(500));
-                input.frame_start_update();
+                input.frame_start_update().unwrap();
             });
         }
         {

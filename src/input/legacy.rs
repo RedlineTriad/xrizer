@@ -482,7 +482,7 @@ mod tests {
         );
         assert!(!got_input);
 
-        fixture.input.frame_start_update();
+        fixture.input.frame_start_update().unwrap();
         let got_input = fixture.input.get_legacy_controller_state(
             1,
             &mut vr::VRControllerState_t::default(),
@@ -502,7 +502,7 @@ mod tests {
 
         f.set_interaction_profile::<Knuckles>(LeftHand);
         f.set_interaction_profile::<Knuckles>(RightHand);
-        f.input.frame_start_update();
+        f.input.frame_start_update().unwrap();
         f.input.openxr.poll_events().unwrap();
         let action = get_action(
             &f.input
@@ -552,7 +552,7 @@ mod tests {
         let update_action_state = |left_state, right_state| {
             fakexr::set_action_state(action, fakexr::ActionState::Bool(left_state), LeftHand);
             fakexr::set_action_state(action, fakexr::ActionState::Bool(right_state), RightHand);
-            f.input.frame_start_update();
+            f.input.frame_start_update().unwrap();
         };
 
         let expect_press = |state: &vr::VRControllerState_t, expect: bool| {
@@ -634,7 +634,7 @@ mod tests {
         }
 
         // Frame update but no change
-        f.input.frame_start_update();
+        f.input.frame_start_update().unwrap();
         for hand in hands {
             let state = get_state(hand);
             expect_press(&state, true);
@@ -719,7 +719,7 @@ mod tests {
 
         f.set_interaction_profile::<SimpleController>(fakexr::UserPath::LeftHand);
         f.set_interaction_profile::<SimpleController>(fakexr::UserPath::RightHand);
-        f.input.frame_start_update();
+        f.input.frame_start_update().unwrap();
         f.input.openxr.poll_events().unwrap();
 
         let mut state = vr::VRControllerState_t::default();
@@ -731,7 +731,7 @@ mod tests {
 
         f.load_actions(c"actions.json");
         f.input.openxr.poll_events().unwrap();
-        f.input.frame_start_update();
+        f.input.frame_start_update().unwrap();
         assert!(!f.input.get_legacy_controller_state(
             1,
             &mut state,
@@ -746,12 +746,12 @@ mod tests {
         f.input.openxr.restart_session().unwrap();
         f.set_interaction_profile::<SimpleController>(LeftHand);
         f.set_interaction_profile::<SimpleController>(RightHand);
-        f.input.frame_start_update();
+        f.input.frame_start_update().unwrap();
         f.input.openxr.poll_events().unwrap();
 
         fakexr::set_grip(f.raw_session(), LeftHand, xr::Posef::IDENTITY);
         fakexr::set_grip(f.raw_session(), RightHand, xr::Posef::IDENTITY);
-        f.input.frame_start_update();
+        f.input.frame_start_update().unwrap();
 
         let seated_origin = vr::ETrackingUniverseOrigin::Seated;
         let left_pose = f.input.get_controller_pose(Hand::Left, Some(seated_origin));
@@ -779,7 +779,7 @@ mod tests {
 
         fakexr::set_grip(f.raw_session(), LeftHand, new_pose);
         fakexr::set_grip(f.raw_session(), RightHand, new_pose);
-        f.input.frame_start_update();
+        f.input.frame_start_update().unwrap();
         compare_pose(
             new_pose,
             f.input
@@ -802,7 +802,7 @@ mod tests {
     fn init_controller_state_on_failure() {
         let f = Fixture::new();
         f.load_actions(c"actions.json");
-        f.input.frame_start_update();
+        f.input.frame_start_update().unwrap();
 
         let mut state = std::mem::MaybeUninit::<vr::VRControllerState_t>::uninit();
         assert!(!f.input.get_legacy_controller_state(
@@ -822,10 +822,10 @@ mod tests {
         f.set_interaction_profile::<SimpleController>(fakexr::UserPath::LeftHand);
         f.set_interaction_profile::<SimpleController>(fakexr::UserPath::RightHand);
         f.input.openxr.poll_events().unwrap();
-        f.input.frame_start_update();
+        f.input.frame_start_update().unwrap();
 
         f.input.openxr.poll_events().unwrap();
-        f.input.frame_start_update();
+        f.input.frame_start_update().unwrap();
         let haptic = f
             .input
             .openxr
@@ -868,10 +868,10 @@ mod tests {
         f.set_interaction_profile::<SimpleController>(fakexr::UserPath::LeftHand);
         f.set_interaction_profile::<SimpleController>(fakexr::UserPath::RightHand);
         f.input.openxr.poll_events().unwrap();
-        f.input.frame_start_update();
+        f.input.frame_start_update().unwrap();
 
         f.input.openxr.poll_events().unwrap();
-        f.input.frame_start_update();
+        f.input.frame_start_update().unwrap();
 
         let haptic = f
             .input

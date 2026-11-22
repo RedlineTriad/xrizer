@@ -170,6 +170,7 @@ pub enum SessionCall {
     BeginFrame,
     EndFrame,
     LocateViews,
+    SyncActions,
     RequestExit,
 }
 
@@ -1335,6 +1336,9 @@ extern "system" fn sync_actions(
     info: *const xr::ActionsSyncInfo,
 ) -> xr::Result {
     let session = get_handle!(session_xr);
+    if let Some(error) = session.take_error(SessionCall::SyncActions) {
+        return error;
+    }
     for hand in [&session.left_hand, &session.right_hand] {
         if let Some(profile) = hand.pending_profile.load() {
             hand.profile.store(profile);
