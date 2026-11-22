@@ -255,7 +255,7 @@ impl Fixture {
 
     #[track_caller]
     pub fn get_action<T: ActionType>(&self, handle: vr::VRActionHandle_t) -> xr::sys::Action {
-        let data = self.input.openxr.session_data.get();
+        let data = self.input.openxr.session_data.get().unwrap();
         let actions = data
             .input_data
             .get_loaded_actions()
@@ -277,7 +277,7 @@ impl Fixture {
         handle: vr::VRActionHandle_t,
         extra_action_type: ExtraActionType,
     ) -> Option<xr::sys::Action> {
-        let data = self.input.openxr.session_data.get();
+        let data = self.input.openxr.session_data.get().unwrap();
         let actions = data
             .input_data
             .get_loaded_actions()
@@ -357,7 +357,13 @@ impl Fixture {
     }
 
     pub fn raw_session(&self) -> xr::sys::Session {
-        self.input.openxr.session_data.get().session.as_raw()
+        self.input
+            .openxr
+            .session_data
+            .get()
+            .unwrap()
+            .session
+            .as_raw()
     }
 }
 
@@ -369,7 +375,7 @@ fn action_sync_reports_runtime_loss() {
         ulActionSet: f.get_action_set_handle(c"/actions/set1"),
         ..Default::default()
     };
-    let session = f.input.openxr.session_data.get().session.as_raw();
+    let session = f.input.openxr.session_data.get().unwrap().session.as_raw();
     fakexr::fail_next_session_call(
         session,
         fakexr::SessionCall::SyncActions,
@@ -432,6 +438,7 @@ fn input_state_flow() {
             .openxr
             .session_data
             .get()
+            .unwrap()
             .input_data
             .get_legacy_actions()
             .is_none()
@@ -727,7 +734,7 @@ fn pose_action_no_restrict() {
     f.load_actions(c"actions.json");
     f.set_interaction_profile::<SimpleController>(LeftHand);
     f.set_interaction_profile::<SimpleController>(RightHand);
-    let session = f.input.openxr.session_data.get().session.as_raw();
+    let session = f.input.openxr.session_data.get().unwrap().session.as_raw();
     let pose_left = xr::Posef {
         position: xr::Vector3f {
             x: 0.5,
@@ -773,7 +780,7 @@ fn raw_pose_switch_profile() {
     f.load_actions(c"actions.json");
     f.set_interaction_profile::<SimpleController>(LeftHand);
     f.set_interaction_profile::<SimpleController>(RightHand);
-    let session = f.input.openxr.session_data.get().session.as_raw();
+    let session = f.input.openxr.session_data.get().unwrap().session.as_raw();
     let pose_left = xr::Posef {
         position: xr::Vector3f {
             x: 0.0,
@@ -880,7 +887,7 @@ fn cased_actions() {
     );
 
     f.set_interaction_profile::<ViveWands>(LeftHand);
-    let session = f.input.openxr.session_data.get().session.as_raw();
+    let session = f.input.openxr.session_data.get().unwrap().session.as_raw();
     fakexr::set_grip(session, LeftHand, xr::Posef::IDENTITY);
     fakexr::set_aim(session, LeftHand, xr::Posef::IDENTITY);
     f.sync(vr::VRActiveActionSet_t {

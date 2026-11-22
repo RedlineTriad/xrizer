@@ -475,7 +475,13 @@ impl<C: openxr_data::Compositor> Input<C> {
         origin: Option<vr::ETrackingUniverseOrigin>,
     ) {
         tracy_span!();
-        let session_data = self.openxr.session_data.get();
+        let Ok(session_data) = self.openxr.session_data.get() else {
+            poses.fill(vr::space_relation_to_openvr_pose(
+                Default::default(),
+                Default::default(),
+            ));
+            return;
+        };
         let devices = session_data.input_data.devices.read().unwrap();
 
         for (i, pose) in poses.iter_mut().enumerate() {
@@ -498,7 +504,7 @@ impl<C: openxr_data::Compositor> Input<C> {
         hand: Hand,
         origin: Option<vr::ETrackingUniverseOrigin>,
     ) -> Option<vr::TrackedDevicePose_t> {
-        let session_data = self.openxr.session_data.get();
+        let session_data = self.openxr.session_data.get().ok()?;
         let controller_index = session_data
             .input_data
             .devices
@@ -516,7 +522,7 @@ impl<C: openxr_data::Compositor> Input<C> {
     ) -> Option<vr::TrackedDevicePose_t> {
         tracy_span!();
 
-        let session_data = self.openxr.session_data.get();
+        let session_data = self.openxr.session_data.get().ok()?;
         let devices = session_data.input_data.devices.read().unwrap();
 
         devices.get_device(index)?.get_pose(
@@ -527,7 +533,9 @@ impl<C: openxr_data::Compositor> Input<C> {
     }
 
     pub fn is_device_connected(&self, index: vr::TrackedDeviceIndex_t) -> bool {
-        let session_data = self.openxr.session_data.get();
+        let Ok(session_data) = self.openxr.session_data.get() else {
+            return false;
+        };
         let devices = session_data.input_data.devices.read().unwrap();
 
         devices.get_device(index).is_some_and(|d| d.connected)
@@ -537,7 +545,7 @@ impl<C: openxr_data::Compositor> Input<C> {
         &self,
         index: vr::TrackedDeviceIndex_t,
     ) -> Option<vr::ETrackedDeviceClass> {
-        let session_data = self.openxr.session_data.get();
+        let session_data = self.openxr.session_data.get().ok()?;
         let devices = session_data.input_data.devices.read().unwrap();
         let device = devices.get_device(index)?;
 
@@ -552,7 +560,7 @@ impl<C: openxr_data::Compositor> Input<C> {
     }
 
     pub fn device_index_to_hand(&self, index: vr::TrackedDeviceIndex_t) -> Option<Hand> {
-        let session_data = self.openxr.session_data.get();
+        let session_data = self.openxr.session_data.get().ok()?;
         let devices = session_data.input_data.devices.read().unwrap();
         let device = devices.get_device(index)?;
 
@@ -560,7 +568,7 @@ impl<C: openxr_data::Compositor> Input<C> {
     }
 
     pub fn get_controller_device_index(&self, hand: Hand) -> Option<vr::TrackedDeviceIndex_t> {
-        let session_data = self.openxr.session_data.get();
+        let session_data = self.openxr.session_data.get().ok()?;
         let devices = session_data.input_data.devices.read().unwrap();
 
         devices.get_controller_index(hand)
@@ -571,7 +579,7 @@ impl<C: openxr_data::Compositor> Input<C> {
         index: vr::TrackedDeviceIndex_t,
         property: vr::ETrackedDeviceProperty,
     ) -> Option<CString> {
-        let session_data = self.openxr.session_data.get();
+        let session_data = self.openxr.session_data.get().ok()?;
         let devices = session_data.input_data.devices.read().unwrap();
         let device = devices.get_device(index)?;
 
@@ -583,7 +591,7 @@ impl<C: openxr_data::Compositor> Input<C> {
         index: vr::TrackedDeviceIndex_t,
         property: vr::ETrackedDeviceProperty,
     ) -> Option<i32> {
-        let session_data = self.openxr.session_data.get();
+        let session_data = self.openxr.session_data.get().ok()?;
         let devices = session_data.input_data.devices.read().unwrap();
         let device = devices.get_device(index)?;
 
@@ -595,7 +603,7 @@ impl<C: openxr_data::Compositor> Input<C> {
         index: vr::TrackedDeviceIndex_t,
         property: vr::ETrackedDeviceProperty,
     ) -> Option<u64> {
-        let session_data = self.openxr.session_data.get();
+        let session_data = self.openxr.session_data.get().ok()?;
         let devices = session_data.input_data.devices.read().unwrap();
         let device = devices.get_device(index)?;
 
@@ -614,7 +622,7 @@ mod tests {
         let mut f = Fixture::new();
         f.load_actions(c"actions.json");
         f.set_interaction_profile::<Knuckles>(fakexr::UserPath::LeftHand);
-        fakexr::add_trackers(f.input.openxr.session_data.get().session.as_raw());
+        fakexr::add_trackers(f.input.openxr.session_data.get().unwrap().session.as_raw());
 
         let frame = || {
             f.input.openxr.poll_events().unwrap();
@@ -642,7 +650,7 @@ mod tests {
         let mut f = Fixture::new();
         f.load_actions(c"actions.json");
         f.set_interaction_profile::<Knuckles>(fakexr::UserPath::LeftHand);
-        fakexr::add_trackers(f.input.openxr.session_data.get().session.as_raw());
+        fakexr::add_trackers(f.input.openxr.session_data.get().unwrap().session.as_raw());
 
         let frame = || {
             f.input.openxr.poll_events().unwrap();

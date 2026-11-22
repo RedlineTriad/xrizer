@@ -168,7 +168,7 @@ impl System {
     }
 
     pub fn reset_views(&self) -> xr::Result<()> {
-        let session = self.openxr.session_data.get();
+        let session = self.openxr.session_data.get()?;
         let display_time = self.openxr.display_time.get();
         let mut views = self.views.lock().unwrap();
         *views = ViewCache::default();
@@ -197,8 +197,7 @@ impl System {
     }
 
     fn get_views(&self, ty: xr::ReferenceSpaceType) -> ViewData {
-        let session = self.openxr.session_data.get();
-        if !self.openxr.is_runtime_lost()
+        if let Ok(session) = self.openxr.session_data.get()
             && let Ok(data) = self
                 .openxr
                 .check_xr("view location", self.try_get_views(&session, ty))
@@ -272,7 +271,9 @@ impl vr::IVRSystem026_Interface for System {
             .openxr
             .session_data
             .get()
-            .current_origin_as_reference_space();
+            .map_or(xr::ReferenceSpaceType::STAGE, |data| {
+                data.current_origin_as_reference_space()
+            });
         let view = self.get_views(ty).views[eye as usize];
 
         // Top and bottom are flipped, for some reason
@@ -442,7 +443,9 @@ impl vr::IVRSystem026_Interface for System {
             }
         };
 
-        let session_data = self.openxr.session_data.get();
+        let Ok(session_data) = self.openxr.session_data.get() else {
+            return Default::default();
+        };
         let mask = session_data
             .session
             .get_visibility_mask_khr(

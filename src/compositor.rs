@@ -211,7 +211,7 @@ impl Compositor {
         self.openxr.poll_events()?;
         self.focused.call_once(|| {});
         {
-            let session_data = self.openxr.session_data.get();
+            let session_data = self.openxr.session_data.get()?;
             let timing_mode = *self.timing_mode.lock().unwrap();
             if matches!(
                 timing_mode,
@@ -461,7 +461,9 @@ impl vr::IVRCompositor029_Interface for Compositor {
             return vr::EVRCompositorError::None;
         }
 
-        let session_data = self.openxr.session_data.get();
+        let Ok(session_data) = self.openxr.session_data.get() else {
+            return vr::EVRCompositorError::RequestFailed;
+        };
         if self.maybe_begin_frame(&session_data).is_ok() {
             vr::EVRCompositorError::None
         } else {
@@ -544,10 +546,10 @@ impl vr::IVRCompositor029_Interface for Compositor {
             ctrl.app_suspend_render = app_suspend_render;
         }
 
-        self.openxr
-            .session_data
-            .get()
-            .comp_data
+        let Ok(data) = self.openxr.session_data.get() else {
+            return;
+        };
+        data.comp_data
             .0
             .lock()
             .unwrap()
@@ -653,10 +655,10 @@ impl vr::IVRCompositor029_Interface for Compositor {
             ctrl.app_fade_grid = app_fade_grid;
         }
 
-        self.openxr
-            .session_data
-            .get()
-            .comp_data
+        let Ok(data) = self.openxr.session_data.get() else {
+            return;
+        };
+        data.comp_data
             .0
             .lock()
             .unwrap()
@@ -751,8 +753,8 @@ impl vr::IVRCompositor029_Interface for Compositor {
         true
     }
     fn PostPresentHandoff(&self) {
-        if !self.openxr.is_runtime_lost() {
-            let _ = self.present_frame(&self.openxr.session_data.get());
+        if let Ok(data) = self.openxr.session_data.get() {
+            let _ = self.present_frame(&data);
         }
     }
     fn ClearLastSubmittedFrame(&self) {
@@ -814,7 +816,9 @@ impl vr::IVRCompositor029_Interface for Compositor {
             return vr::EVRCompositorError::DoNotHaveFocus;
         }
 
-        let mut session_lock = self.openxr.session_data.get();
+        let Ok(mut session_lock) = self.openxr.session_data.get() else {
+            return vr::EVRCompositorError::RequestFailed;
+        };
         let mut frame_lock = session_lock.comp_data.0.lock().unwrap();
 
         let ctrl = match frame_lock.as_mut() {
@@ -828,7 +832,10 @@ impl vr::IVRCompositor029_Interface for Compositor {
                 }
                 info!("Received game texture, restarted session with new data");
 
-                session_lock = self.openxr.session_data.get();
+                let Ok(restarted_session) = self.openxr.session_data.get() else {
+                    return vr::EVRCompositorError::RequestFailed;
+                };
+                session_lock = restarted_session;
                 frame_lock = session_lock.comp_data.0.lock().unwrap();
                 let Some(ctrl) = frame_lock.as_mut() else {
                     return vr::EVRCompositorError::RequestFailed;
@@ -884,7 +891,7 @@ impl vr::IVRCompositor029_Interface for Compositor {
         output_pose: *mut vr::TrackedDevicePose_t,
         output_game_pose: *mut vr::TrackedDevicePose_t,
     ) -> vr::EVRCompositorError {
-        if self.openxr.is_runtime_lost() {
+        if self.openxr.session_data.get().is_err() {
             clear_poses(output_pose, 1);
             clear_poses(output_game_pose, 1);
             return vr::EVRCompositorError::RequestFailed;
@@ -917,7 +924,7 @@ impl vr::IVRCompositor029_Interface for Compositor {
         game_pose_count: u32,
     ) -> vr::EVRCompositorError {
         tracy_span!("GetLastPoses impl");
-        if self.openxr.is_runtime_lost() {
+        if self.openxr.session_data.get().is_err() {
             clear_poses(render_pose_array, render_pose_count);
             clear_poses(game_pose_array, game_pose_count);
             return vr::EVRCompositorError::RequestFailed;
@@ -1641,7 +1648,7 @@ mod tests {
                 assert_eq!(self.wait_get_poses(), None);
             }
 
-            let data = self.comp.openxr.session_data.get();
+            let data = self.comp.openxr.session_data.get().unwrap();
             let lock = data.comp_data.0.lock().unwrap();
             let DynFrameController::Fake(ctrl) = lock.as_ref().unwrap() else {
                 panic!("Frame controller was not set up or not faked!");
@@ -1651,7 +1658,14 @@ mod tests {
 
         #[track_caller]
         fn check_frame_state(&self, state: fakexr::FrameState) {
-            let session = self.comp.openxr.session_data.get().session.as_raw();
+            let session = self
+                .comp
+                .openxr
+                .session_data
+                .get()
+                .unwrap()
+                .session
+                .as_raw();
             assert_eq!(fakexr::session_frame_state(session), state);
         }
     }
@@ -1684,7 +1698,7 @@ mod tests {
         ] {
             let f = Fixture::new();
             f.ensure_real_session(false);
-            let session = f.comp.openxr.session_data.get().session.as_raw();
+            let session = f.comp.openxr.session_data.get().unwrap().session.as_raw();
             let called = fakexr::fail_next_session_call(session, call, error);
             let mut render =
                 vr::space_relation_to_openvr_pose(Default::default(), Default::default());
@@ -1701,7 +1715,7 @@ mod tests {
             assert_eq!(f.wait_get_poses(), RequestFailed);
             assert_eq!(f.submit(vr::EVREye::Left), RequestFailed);
             assert_eq!(f.comp.SubmitExplicitTimingData(), RequestFailed);
-            f.check_frame_state(state);
+            assert_eq!(fakexr::session_frame_state(session), state);
 
             let request_exit = fakexr::fail_next_session_call(
                 session,
@@ -1722,14 +1736,17 @@ mod tests {
         );
         f.ensure_real_session(true);
         assert_eq!(f.wait_get_poses(), None);
-        let session = f.comp.openxr.session_data.get().session.as_raw();
+        let session = f.comp.openxr.session_data.get().unwrap().session.as_raw();
         fakexr::fail_next_session_call(
             session,
             fakexr::SessionCall::BeginFrame,
             xr::sys::Result::ERROR_SESSION_LOST,
         );
         assert_eq!(f.comp.SubmitExplicitTimingData(), RequestFailed);
-        f.check_frame_state(fakexr::FrameState::Waited);
+        assert_eq!(
+            fakexr::session_frame_state(session),
+            fakexr::FrameState::Waited
+        );
         assert_eq!(f.wait_get_poses(), RequestFailed);
     }
 
@@ -1737,7 +1754,7 @@ mod tests {
     fn transient_wait_failure_can_retry() {
         let f = Fixture::new();
         f.ensure_real_session(false);
-        let session = f.comp.openxr.session_data.get().session.as_raw();
+        let session = f.comp.openxr.session_data.get().unwrap().session.as_raw();
         fakexr::fail_next_session_call(
             session,
             fakexr::SessionCall::WaitFrame,
@@ -1748,6 +1765,33 @@ mod tests {
         assert!(!f.comp.openxr.is_runtime_lost());
         assert_eq!(f.wait_get_poses(), None);
         f.check_frame_state(fakexr::FrameState::Begun);
+    }
+
+    #[test]
+    fn replacement_session_creation_failure_leaves_no_session() {
+        let f = Fixture::new();
+        f.ensure_real_session(false);
+        let openxr = &f.comp.openxr;
+        fakexr::fail_next_session_creation(
+            openxr.instance.as_raw(),
+            xr::sys::Result::ERROR_RUNTIME_FAILURE,
+        );
+        assert!(matches!(
+            openxr.restart_session(),
+            Err(openxr_data::SessionRestartError::Create(
+                openxr_data::SessionCreationError::SessionCreationFailed(
+                    xr::sys::Result::ERROR_RUNTIME_FAILURE
+                )
+            ))
+        ));
+        assert!(openxr.session_data.get().is_err());
+        assert_eq!(f.wait_get_poses(), RequestFailed);
+        assert_eq!(f.submit(vr::EVREye::Left), RequestFailed);
+        assert_eq!(f.comp.SubmitExplicitTimingData(), RequestFailed);
+        assert!(matches!(
+            openxr.restart_session(),
+            Err(openxr_data::SessionRestartError::NoSession)
+        ));
     }
 
     #[test]
@@ -1850,7 +1894,7 @@ mod tests {
         f.ensure_real_session(false);
 
         let get_swapchain_width = || {
-            let data = f.comp.openxr.session_data.get();
+            let data = f.comp.openxr.session_data.get().unwrap();
             let lock = data.comp_data.0.lock().unwrap();
             let DynFrameController::Fake(ctrl) = lock.as_ref().unwrap() else {
                 panic!("Frame controller was not set up or not faked!");
@@ -1914,7 +1958,7 @@ mod tests {
 
         assert_eq!(f.wait_get_poses(), None);
         {
-            let data = f.comp.openxr.session_data.get();
+            let data = f.comp.openxr.session_data.get().unwrap();
             let lock = data.comp_data.0.lock().unwrap();
             let DynFrameController::Fake(ctrl) = lock.as_ref().unwrap() else {
                 panic!("Frame controller was not set up or not faked!");
@@ -1928,7 +1972,7 @@ mod tests {
 
         assert_eq!(f.wait_get_poses(), None);
         {
-            let data = f.comp.openxr.session_data.get();
+            let data = f.comp.openxr.session_data.get().unwrap();
             let lock = data.comp_data.0.lock().unwrap();
             let DynFrameController::Fake(ctrl) = lock.as_ref().unwrap() else {
                 panic!("Frame controller was not set up or not faked!");
@@ -1942,7 +1986,7 @@ mod tests {
 
         assert_eq!(f.wait_get_poses(), None);
         {
-            let data = f.comp.openxr.session_data.get();
+            let data = f.comp.openxr.session_data.get().unwrap();
             let lock = data.comp_data.0.lock().unwrap();
             let DynFrameController::Fake(ctrl) = lock.as_ref().unwrap() else {
                 panic!("Frame controller was not set up or not faked!");
@@ -1997,7 +2041,7 @@ mod tests {
         assert_eq!(f.wait_get_poses(), None);
         assert_eq!(f.submit(vr::EVREye::Left), None);
         assert_eq!(f.submit(vr::EVREye::Right), None);
-        let data = f.comp.openxr.session_data.get();
+        let data = f.comp.openxr.session_data.get().unwrap();
         let lock = data.comp_data.0.lock().unwrap();
         let DynFrameController::Fake(ctrl) = lock.as_ref().unwrap() else {
             panic!("Frame controller was not set up or not faked!");

@@ -190,6 +190,16 @@ pub fn fail_next_session_call(
     called
 }
 
+pub fn fail_next_session_creation(instance: xr::Instance, error: xr::Result) {
+    let instance = instance.to_handle().unwrap();
+    assert!(
+        instance
+            .next_session_creation_error
+            .swap(Some(error))
+            .is_none()
+    );
+}
+
 macro_rules! fn_unimplemented_impl {
     ($($param:ident),+) => {
         fn_unimplemented_impl!($($param),+  -> []);
@@ -503,6 +513,7 @@ struct Instance {
     paths: Mutex<SlotMap<DefaultKey, String>>,
     string_to_path: Mutex<HashMap<String, DefaultKey>>,
     action_sets: Mutex<HashSet<xr::ActionSet>>,
+    next_session_creation_error: AtomicCell<Option<xr::Result>>,
     left_hand_key: DefaultKey,
     right_hand_key: DefaultKey,
 }
@@ -884,6 +895,7 @@ extern "system" fn create_instance(
         paths: Mutex::new(paths),
         string_to_path: Mutex::new(string_to_path),
         action_sets: Default::default(),
+        next_session_creation_error: AtomicCell::default(),
         left_hand_key,
         right_hand_key,
     });
@@ -903,6 +915,9 @@ extern "system" fn create_session(
     session: *mut xr::Session,
 ) -> xr::Result {
     let instance = get_handle!(instance);
+    if let Some(error) = instance.next_session_creation_error.take() {
+        return error;
+    }
     let info = unsafe { create_info.as_ref().unwrap() };
     let vk = unsafe {
         (info.next as *const xr::GraphicsBindingVulkanKHR)

@@ -41,7 +41,9 @@ impl<C: openxr_data::Compositor> Input<C> {
     pub fn setup_legacy_actions(&self) {
         debug!("setting up legacy actions");
 
-        let session_data = self.openxr.session_data.get();
+        let Ok(session_data) = self.openxr.session_data.get() else {
+            return;
+        };
         let session = &session_data.session;
         let legacy = LegacyActionData::new(
             &self.openxr.instance,
@@ -118,10 +120,17 @@ impl<C: openxr_data::Compositor> Input<C> {
         };
         let hand_path = self.get_subaction_path(hand);
 
-        let data = self.openxr.session_data.get();
+        let Ok(data) = self.openxr.session_data.get() else {
+            return;
+        };
         if let Some(manifest_actions) = data.input_data.get_loaded_actions() {
             // Game provided action manifest but also calls the legacy action's pulse method.
-            self.legacy_haptic_via_manifest(manifest_actions, hand_path, duration_us);
+            self.legacy_haptic_via_manifest(
+                &data.session,
+                manifest_actions,
+                hand_path,
+                duration_us,
+            );
             return;
         }
 
@@ -157,6 +166,7 @@ impl<C: openxr_data::Compositor> Input<C> {
     /// legacy-input haptic interface functions while providing manifest files.
     fn legacy_haptic_via_manifest(
         &self,
+        session: &xr::Session<xr::AnyGraphics>,
         manifest_actions: &ManifestLoadedActions,
         hand_path: xr::Path,
         duration_us: ::std::ffi::c_ushort,
@@ -165,7 +175,7 @@ impl<C: openxr_data::Compositor> Input<C> {
         manifest_actions
             .haptic_action
             .apply_feedback(
-                &self.openxr.session_data.get().session,
+                session,
                 hand_path,
                 &xr::HapticVibration::new()
                     .amplitude(1.0)
@@ -196,7 +206,9 @@ impl<C: openxr_data::Compositor> Input<C> {
         let mut state = WriteOnDrop::new(state);
         let state = &mut state.value;
 
-        let data = self.openxr.session_data.get();
+        let Ok(data) = self.openxr.session_data.get() else {
+            return false;
+        };
         if data.input_data.get_loaded_actions().is_some() {
             debug!("not returning legacy controller state due to loaded actions");
             return false;
@@ -216,8 +228,6 @@ impl<C: openxr_data::Compositor> Input<C> {
         };
 
         let hand_path = self.get_subaction_path(hand);
-
-        let data = self.openxr.session_data.get();
 
         state.unPacketNum = self.legacy_state.packet_num.load(Ordering::Relaxed);
 
@@ -509,6 +519,7 @@ mod tests {
                 .openxr
                 .session_data
                 .get()
+                .unwrap()
                 .input_data
                 .get_legacy_actions()
                 .unwrap()
@@ -831,6 +842,7 @@ mod tests {
             .openxr
             .session_data
             .get()
+            .unwrap()
             .input_data
             .get_legacy_actions()
             .unwrap()
@@ -878,6 +890,7 @@ mod tests {
             .openxr
             .session_data
             .get()
+            .unwrap()
             .input_data
             .get_loaded_actions()
             .unwrap()
