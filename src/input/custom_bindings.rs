@@ -884,7 +884,7 @@ mod tests {
     macro_rules! get_toggle_action {
         ($fixture:expr, $handle:expr, $toggle_data:ident) => {
             let input = $fixture.input.clone();
-            let data = input.openxr.session_data.get();
+            let data = input.openxr.session_data.get().unwrap();
             let actions = data.input_data.get_loaded_actions().unwrap();
             let ExtraActionData { toggle_action, .. } = actions.try_get_extra($handle).unwrap();
 
@@ -895,7 +895,7 @@ mod tests {
     macro_rules! get_analog_action {
         ($fixture:expr, $handle:expr, $analog_data:ident) => {
             let input = $fixture.input.clone();
-            let data = input.openxr.session_data.get();
+            let data = input.openxr.session_data.get().unwrap();
             let actions = data.input_data.get_loaded_actions().unwrap();
             let ExtraActionData { analog_action, .. } = actions.try_get_extra($handle).unwrap();
 
@@ -906,7 +906,7 @@ mod tests {
     macro_rules! get_dpad_action {
         ($fixture:expr, $handle:expr, $dpad_data:ident, $profile:ident) => {
             let input = $fixture.input.clone();
-            let data = input.openxr.session_data.get();
+            let data = input.openxr.session_data.get().unwrap();
             let actions = data.input_data.get_loaded_actions().unwrap();
             let path = $fixture
                 .input
@@ -937,7 +937,7 @@ mod tests {
     macro_rules! get_grab_action {
         ($fixture:expr, $handle:expr, $grab_data:ident) => {
             let input = $fixture.input.clone();
-            let data = input.openxr.session_data.get();
+            let data = input.openxr.session_data.get().unwrap();
             let actions = data.input_data.get_loaded_actions().unwrap();
             let ExtraActionData { grab_actions, .. } = actions.try_get_extra($handle).unwrap();
 
@@ -948,7 +948,7 @@ mod tests {
     macro_rules! get_double_action {
         ($fixture:expr, $handle:expr, $double_data:ident) => {
             let input = $fixture.input.clone();
-            let data = input.openxr.session_data.get();
+            let data = input.openxr.session_data.get().unwrap();
             let actions = data.input_data.get_loaded_actions().unwrap();
             let ExtraActionData { double_action, .. } = actions.try_get_extra($handle).unwrap();
 
@@ -1008,7 +1008,7 @@ mod tests {
         let boolact = f.get_action_handle(c"/actions/set1/in/boolact");
 
         f.load_actions(c"actions_dpad.json");
-        f.input.openxr.restart_session();
+        f.input.openxr.restart_session().unwrap();
 
         get_dpad_action!(f, boolact, dpad_data, ViveWands);
 
@@ -1082,7 +1082,7 @@ mod tests {
         let boolact = f.get_action_handle(c"/actions/set1/in/boolact");
 
         f.load_actions(c"actions_dpad_mixed.json");
-        f.input.openxr.restart_session();
+        f.input.openxr.restart_session().unwrap();
 
         get_dpad_action!(f, boolact, _dpad, ViveWands);
 
@@ -1119,7 +1119,7 @@ mod tests {
         let boolact = f.get_action_handle(c"/actions/set1/in/boolact");
 
         f.load_actions(c"actions_dpad_multi.json");
-        f.input.openxr.restart_session();
+        f.input.openxr.restart_session().unwrap();
 
         get_dpad_action!(f, boolact, dpad_data_vive, ViveWands);
         get_dpad_action!(f, boolact, dpad_data_knuckles, Knuckles);
@@ -1221,7 +1221,7 @@ mod tests {
 
         f.set_interaction_profile::<OculusTouch>(LeftHand);
         let input = f.input.clone();
-        let data = input.openxr.session_data.get();
+        let data = input.openxr.session_data.get().unwrap();
         let actions = data.input_data.get_loaded_actions().unwrap();
         let path = f
             .input

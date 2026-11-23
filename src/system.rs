@@ -37,42 +37,39 @@ impl ViewCache {
         session: &SessionData,
         display_time: xr::Time,
         ty: xr::ReferenceSpaceType,
-    ) -> ViewData {
-        match ty {
-            xr::ReferenceSpaceType::VIEW => {
-                self.view
-                    .get_or_insert_with(|| Self::get_views_view_space(session, display_time))
-                    .data
+    ) -> xr::Result<ViewData> {
+        let view = match self.view {
+            Some(view) => view,
+            None => {
+                let view = Self::get_views_view_space(session, display_time)?;
+                self.view = Some(view);
+                view
             }
-            xr::ReferenceSpaceType::LOCAL | xr::ReferenceSpaceType::STAGE => {
-                let view = match ty {
-                    xr::ReferenceSpaceType::LOCAL => &mut self.local,
-                    xr::ReferenceSpaceType::STAGE => &mut self.stage,
-                    _ => unreachable!(),
-                };
-
-                *view.get_or_insert_with(|| {
-                    let view_rots = self
-                        .view
-                        .get_or_insert_with(|| Self::get_views_view_space(session, display_time))
-                        .original_orientations;
-
-                    Self::get_views_other_space(session, display_time, ty, view_rots)
-                })
-            }
+        };
+        let cached = match ty {
+            xr::ReferenceSpaceType::VIEW => return Ok(view.data),
+            xr::ReferenceSpaceType::LOCAL => &mut self.local,
+            xr::ReferenceSpaceType::STAGE => &mut self.stage,
             other => panic!("unexpected reference space type: {other:?}"),
+        };
+        if let Some(data) = *cached {
+            return Ok(data);
         }
+        let data =
+            Self::get_views_other_space(session, display_time, ty, view.original_orientations)?;
+        *cached = Some(data);
+        Ok(data)
     }
 
-    fn get_views_view_space(session: &SessionData, display_time: xr::Time) -> ViewDataViewSpace {
-        let (flags, mut views) = session
-            .session
-            .locate_views(
-                xr::ViewConfigurationType::PRIMARY_STEREO,
-                display_time,
-                session.get_space_from_type(xr::ReferenceSpaceType::VIEW),
-            )
-            .expect("Couldn't locate views");
+    fn get_views_view_space(
+        session: &SessionData,
+        display_time: xr::Time,
+    ) -> xr::Result<ViewDataViewSpace> {
+        let (flags, mut views) = session.session.locate_views(
+            xr::ViewConfigurationType::PRIMARY_STEREO,
+            display_time,
+            session.get_space_from_type(xr::ReferenceSpaceType::VIEW),
+        )?;
 
         let original_orientations = views
             .iter_mut()
@@ -90,7 +87,7 @@ impl ViewCache {
             .try_into()
             .unwrap();
 
-        ViewDataViewSpace {
+        Ok(ViewDataViewSpace {
             data: ViewData {
                 flags,
                 views: views
@@ -98,7 +95,7 @@ impl ViewCache {
                     .unwrap_or_else(|v: Vec<xr::View>| panic!("Expected 2 views, got {}", v.len())),
             },
             original_orientations,
-        }
+        })
     }
 
     fn get_views_other_space(
@@ -106,15 +103,12 @@ impl ViewCache {
         display_time: xr::Time,
         ty: xr::ReferenceSpaceType,
         view_data_orientations_inverse: [Quat; 2],
-    ) -> ViewData {
-        let (flags, mut views) = session
-            .session
-            .locate_views(
-                xr::ViewConfigurationType::PRIMARY_STEREO,
-                display_time,
-                session.get_space_from_type(ty),
-            )
-            .expect("Couldn't locate views");
+    ) -> xr::Result<ViewData> {
+        let (flags, mut views) = session.session.locate_views(
+            xr::ViewConfigurationType::PRIMARY_STEREO,
+            display_time,
+            session.get_space_from_type(ty),
+        )?;
 
         for (
             xr::View {
@@ -138,12 +132,12 @@ impl ViewCache {
             };
         }
 
-        ViewData {
+        Ok(ViewData {
             flags,
             views: views
                 .try_into()
                 .unwrap_or_else(|v: Vec<xr::View>| panic!("Expected 2 views, got {}", v.len())),
-        }
+        })
     }
 }
 
@@ -173,24 +167,56 @@ impl System {
         }
     }
 
-    pub fn reset_views(&self) {
-        std::mem::take(&mut *self.views.lock().unwrap());
-        let session = self.openxr.session_data.get();
+    pub fn reset_views(&self) -> xr::Result<()> {
+        let session = self.openxr.session_data.get()?;
         let display_time = self.openxr.display_time.get();
         let mut views = self.views.lock().unwrap();
-        views.get_views(&session, display_time, xr::ReferenceSpaceType::VIEW);
-        views.get_views(
-            &session,
-            display_time,
-            session.current_origin_as_reference_space(),
-        );
+        *views = ViewCache::default();
+        self.openxr
+            .check_xr(
+                "view location",
+                views.get_views(
+                    &session,
+                    display_time,
+                    session.current_origin_as_reference_space(),
+                ),
+            )
+            .map(|_| ())
     }
 
-    pub fn get_views(&self, ty: xr::ReferenceSpaceType) -> ViewData {
+    pub(crate) fn try_get_views(
+        &self,
+        session: &SessionData,
+        ty: xr::ReferenceSpaceType,
+    ) -> xr::Result<ViewData> {
         tracy_span!();
-        let session = self.openxr.session_data.get();
-        let mut views = self.views.lock().unwrap();
-        views.get_views(&session, self.openxr.display_time.get(), ty)
+        self.views
+            .lock()
+            .unwrap()
+            .get_views(session, self.openxr.display_time.get(), ty)
+    }
+
+    fn get_views(&self, ty: xr::ReferenceSpaceType) -> ViewData {
+        if let Ok(session) = self.openxr.session_data.get()
+            && let Ok(data) = self
+                .openxr
+                .check_xr("view location", self.try_get_views(&session, ty))
+        {
+            return data;
+        }
+        let angle = std::f32::consts::FRAC_PI_4;
+        ViewData {
+            flags: xr::ViewStateFlags::EMPTY,
+            views: [xr::View {
+                pose: xr::Posef::IDENTITY,
+                fov: xr::Fovf {
+                    angle_left: -angle,
+                    angle_right: angle,
+                    angle_up: angle,
+                    angle_down: -angle,
+                },
+            }; 2],
+        }
     }
 }
 
@@ -245,7 +271,9 @@ impl vr::IVRSystem026_Interface for System {
             .openxr
             .session_data
             .get()
-            .current_origin_as_reference_space();
+            .map_or(xr::ReferenceSpaceType::STAGE, |data| {
+                data.current_origin_as_reference_space()
+            });
         let view = self.get_views(ty).views[eye as usize];
 
         // Top and bottom are flipped, for some reason
@@ -415,7 +443,9 @@ impl vr::IVRSystem026_Interface for System {
             }
         };
 
-        let session_data = self.openxr.session_data.get();
+        let Ok(session_data) = self.openxr.session_data.get() else {
+            return Default::default();
+        };
         let mask = session_data
             .session
             .get_visibility_mask_khr(

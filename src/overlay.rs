@@ -2,7 +2,7 @@ use crate::{
     clientcore::{Injected, Injector},
     compositor::{Compositor, is_usable_swapchain},
     graphics_backends::{GraphicsBackend, SupportedBackend, supported_apis_enum},
-    openxr_data::{GraphicalSession, OpenXrData, Session, SessionData},
+    openxr_data::{GraphicalSession, OpenXrData, Session, SessionData, SessionReadGuard},
 };
 use glam::{Quat, Vec3, vec3};
 use log::{debug, trace};
@@ -32,9 +32,6 @@ pub struct OverlayMan {
     skybox: RwLock<Vec<OverlayKey>>,
 }
 
-#[derive(derive_more::Deref)]
-struct RealSessionData<'a>(std::sync::RwLockReadGuard<'a, std::mem::ManuallyDrop<SessionData>>);
-
 impl OverlayMan {
     pub fn new(openxr: Arc<OpenXrData<Compositor>>, injector: &Injector) -> Self {
         Self {
@@ -51,23 +48,33 @@ impl OverlayMan {
         &self,
         texture: &vr::Texture_t,
         bounds: vr::VRTextureBounds_t,
-    ) -> Result<RealSessionData<'_>, vr::EVROverlayError> {
+    ) -> Result<SessionReadGuard<'_>, vr::EVROverlayError> {
         if !SupportedBackend::is_texture_type_supported(texture.eType) {
             log::warn!("Unsupported texture type: {:?}", texture.eType);
             return Err(vr::EVROverlayError::InvalidTexture);
         }
 
-        if !self.openxr.session_data.get().is_real_session()
-            && self
-                .compositor
+        let get_session = || {
+            self.openxr
+                .session_data
                 .get()
-                .expect("Need to restart session, but compositor hasn't been set up...")
-                .initialize_real_session(texture, bounds)
-                .is_err()
+                .map_err(|_| vr::EVROverlayError::RequestFailed)
+        };
+        let session = get_session()?;
+        if session.is_real_session() {
+            return Ok(session);
+        }
+        drop(session);
+        if self
+            .compositor
+            .get()
+            .expect("Need to restart session, but compositor hasn't been set up...")
+            .initialize_real_session(texture, bounds)
+            .is_err()
         {
             Err(vr::EVROverlayError::InvalidTexture)
         } else {
-            Ok(RealSessionData(self.openxr.session_data.get()))
+            get_session()
         }
     }
 
@@ -505,7 +512,7 @@ impl Overlay {
     fn set_texture(
         &mut self,
         key: OverlayKey,
-        session_data: RealSessionData<'_>,
+        session_data: SessionReadGuard<'_>,
         texture: vr::Texture_t,
     ) -> Result<(), vr::EVROverlayError> {
         let backend = match &self.compositor {

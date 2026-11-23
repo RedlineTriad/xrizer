@@ -164,6 +164,42 @@ pub fn session_frame_state(session: xr::Session) -> FrameState {
     session.frame_state.load()
 }
 
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+pub enum SessionCall {
+    WaitFrame,
+    BeginFrame,
+    EndFrame,
+    LocateViews,
+    SyncActions,
+    RequestExit,
+}
+
+pub fn fail_next_session_call(
+    session: xr::Session,
+    call: SessionCall,
+    result: xr::Result,
+) -> Arc<AtomicBool> {
+    let called = Arc::new(AtomicBool::new(false));
+    let session = session.to_handle().unwrap();
+    let previous = session
+        .next_error
+        .lock()
+        .unwrap()
+        .replace((call, result, called.clone()));
+    assert!(previous.is_none());
+    called
+}
+
+pub fn fail_next_session_creation(instance: xr::Instance, error: xr::Result) {
+    let instance = instance.to_handle().unwrap();
+    assert!(
+        instance
+            .next_session_creation_error
+            .swap(Some(error))
+            .is_none()
+    );
+}
+
 macro_rules! fn_unimplemented_impl {
     ($($param:ident),+) => {
         fn_unimplemented_impl!($($param),+  -> []);
@@ -477,6 +513,7 @@ struct Instance {
     paths: Mutex<SlotMap<DefaultKey, String>>,
     string_to_path: Mutex<HashMap<String, DefaultKey>>,
     action_sets: Mutex<HashSet<xr::ActionSet>>,
+    next_session_creation_error: AtomicCell<Option<xr::Result>>,
     left_hand_key: DefaultKey,
     right_hand_key: DefaultKey,
 }
@@ -542,9 +579,20 @@ struct Session {
     should_render: AtomicBool,
     frame_state: AtomicCell<FrameState>,
     with_trackers: AtomicBool,
+    next_error: Mutex<Option<(SessionCall, xr::Result, Arc<AtomicBool>)>>,
 }
 
 impl Session {
+    fn take_error(&self, call: SessionCall) -> Option<xr::Result> {
+        let mut next = self.next_error.lock().unwrap();
+        if next.as_ref().is_some_and(|(target, _, _)| *target == call) {
+            let (_, result, called) = next.take().unwrap();
+            called.store(true, Ordering::Relaxed);
+            return Some(result);
+        }
+        None
+    }
+
     fn synchronized(self: &Arc<Self>) {
         self.state.store(xr::SessionState::SYNCHRONIZED);
         let session = Self::instances()
@@ -847,6 +895,7 @@ extern "system" fn create_instance(
         paths: Mutex::new(paths),
         string_to_path: Mutex::new(string_to_path),
         action_sets: Default::default(),
+        next_session_creation_error: AtomicCell::default(),
         left_hand_key,
         right_hand_key,
     });
@@ -866,6 +915,9 @@ extern "system" fn create_session(
     session: *mut xr::Session,
 ) -> xr::Result {
     let instance = get_handle!(instance);
+    if let Some(error) = instance.next_session_creation_error.take() {
+        return error;
+    }
     let info = unsafe { create_info.as_ref().unwrap() };
     let vk = unsafe {
         (info.next as *const xr::GraphicsBindingVulkanKHR)
@@ -885,6 +937,7 @@ extern "system" fn create_session(
         state_synced: true.into(),
         should_render: false.into(),
         frame_state: FrameState::Ended.into(),
+        next_error: Mutex::default(),
         with_trackers: false.into(),
     });
 
@@ -1212,6 +1265,9 @@ extern "system" fn path_to_string(
 
 extern "system" fn request_exit_session(session: xr::Session) -> xr::Result {
     let sess = get_handle!(session);
+    if let Some(error) = sess.take_error(SessionCall::RequestExit) {
+        return error;
+    }
     send_event(
         &sess.event_sender,
         xr::EventDataSessionStateChanged {
@@ -1295,6 +1351,9 @@ extern "system" fn sync_actions(
     info: *const xr::ActionsSyncInfo,
 ) -> xr::Result {
     let session = get_handle!(session_xr);
+    if let Some(error) = session.take_error(SessionCall::SyncActions) {
+        return error;
+    }
     for hand in [&session.left_hand, &session.right_hand] {
         if let Some(profile) = hand.pending_profile.load() {
             hand.profile.store(profile);
@@ -1700,6 +1759,9 @@ extern "system" fn wait_frame(
     state: *mut xr::FrameState,
 ) -> xr::Result {
     let session = get_handle!(session);
+    if let Some(error) = session.take_error(SessionCall::WaitFrame) {
+        return error;
+    }
     if let Err(e) = transition_frame_state(&session.frame_state, FrameState::Waited) {
         return e;
     }
@@ -1720,6 +1782,9 @@ extern "system" fn begin_frame(
     _info: *const xr::FrameBeginInfo,
 ) -> xr::Result {
     let session = get_handle!(session);
+    if let Some(error) = session.take_error(SessionCall::BeginFrame) {
+        return error;
+    }
     if let Err(e) = transition_frame_state(&session.frame_state, FrameState::Begun) {
         return e;
     }
@@ -1728,6 +1793,9 @@ extern "system" fn begin_frame(
 
 extern "system" fn end_frame(session: xr::Session, _info: *const xr::FrameEndInfo) -> xr::Result {
     let session = get_handle!(session);
+    if let Some(error) = session.take_error(SessionCall::EndFrame) {
+        return error;
+    }
     if let Err(e) = transition_frame_state(&session.frame_state, FrameState::Ended) {
         return e;
     }
@@ -1745,7 +1813,10 @@ extern "system" fn locate_views(
     output: *mut u32,
     views: *mut xr::View,
 ) -> xr::Result {
-    let _session = get_handle!(session);
+    let sess = get_handle!(session);
+    if let Some(error) = sess.take_error(SessionCall::LocateViews) {
+        return error;
+    }
     if !state.is_null() {
         unsafe {
             state.write(xr::ViewState {

@@ -103,19 +103,21 @@ impl<C: openxr_data::Compositor> Input<C> {
         let mut map = SlotMap::with_key();
         let left_hand_key = map.insert(c"/user/hand/left".into());
         let right_hand_key = map.insert(c"/user/hand/right".into());
-        let subaction_paths = SubactionPaths::new(&openxr.instance);
-        let pose_data = PoseData::new(
-            &openxr.instance,
-            subaction_paths.left,
-            subaction_paths.right,
-        );
-        openxr
-            .session_data
-            .get()
-            .input_data
-            .pose_data
-            .set(pose_data)
-            .unwrap_or_else(|_| panic!("PoseData already setup"));
+        let subaction_paths = if let Ok(session) = openxr.session_data.get() {
+            let paths = SubactionPaths::new(&openxr.instance);
+            let pose_data = PoseData::new(&openxr.instance, paths.left, paths.right);
+            session
+                .input_data
+                .pose_data
+                .set(pose_data)
+                .unwrap_or_else(|_| panic!("PoseData already setup"));
+            paths
+        } else {
+            SubactionPaths {
+                left: xr::Path::NULL,
+                right: xr::Path::NULL,
+            }
+        };
 
         Self {
             openxr,
@@ -198,7 +200,7 @@ impl<C: openxr_data::Compositor> Input<C> {
             return self.state_from_bindings_left_right(action);
         }
 
-        let session = self.openxr.session_data.get();
+        let session = self.openxr.session_data.get().ok()?;
         let LoadedActions::Manifest(loaded_actions) = session.input_data.actions.get()? else {
             return None;
         };
@@ -317,7 +319,9 @@ macro_rules! get_action_from_handle {
     };
 
     ($self:expr, $handle:expr, $session_data:ident, $action:ident, $loaded:ident) => {
-        let $session_data = $self.openxr.session_data.get();
+        let Ok($session_data) = $self.openxr.session_data.get() else {
+            return vr::EVRInputError::IPCError;
+        };
         let Some($loaded) = $session_data.input_data.get_loaded_actions() else {
             return vr::EVRInputError::InvalidHandle;
         };
@@ -364,13 +368,10 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
         vr::EVRInputError::None
     }
     fn IsUsingLegacyInput(&self) -> bool {
-        return self
-            .openxr
+        self.openxr
             .session_data
             .get()
-            .input_data
-            .get_legacy_actions()
-            .is_some();
+            .is_ok_and(|data| data.input_data.get_legacy_actions().is_some())
     }
     fn GetComponentStateForBinding(
         &self,
@@ -675,7 +676,9 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
         //    std::mem::size_of::<vr::InputSkeletalActionData_t>()
         //);
 
-        let data = self.openxr.session_data.get();
+        let Ok(data) = self.openxr.session_data.get() else {
+            return vr::EVRInputError::IPCError;
+        };
         let Some(loaded) = data.input_data.get_loaded_actions() else {
             return vr::EVRInputError::InvalidHandle;
         };
@@ -724,7 +727,9 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
             );
         }
 
-        let data = self.openxr.session_data.get();
+        let Ok(data) = self.openxr.session_data.get() else {
+            return vr::EVRInputError::IPCError;
+        };
         let Some(loaded) = data.input_data.get_loaded_actions() else {
             return vr::EVRInputError::InvalidHandle;
         };
@@ -1014,6 +1019,9 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
         active_set_size: u32,
         active_set_count: u32,
     ) -> vr::EVRInputError {
+        if self.openxr.is_runtime_lost() {
+            return vr::EVRInputError::IPCError;
+        }
         // alyx, portal 2 ce
         if active_set_count == 0 || active_set_size == 0 {
             return vr::EVRInputError::NoActiveActionSet;
@@ -1033,7 +1041,9 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
             crate::warn_once!("Per device action set restriction is not implemented yet.");
         }
 
-        let data = self.openxr.session_data.get();
+        let Ok(data) = self.openxr.session_data.get() else {
+            return vr::EVRInputError::IPCError;
+        };
         let Some(actions) = data.input_data.get_loaded_actions() else {
             return vr::EVRInputError::InvalidParam;
         };
@@ -1059,13 +1069,12 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
             ));
             sync_sets.push(xr::ActiveActionSet::new(&skeletal_input.set));
             sync_sets.push(xr::ActiveActionSet::new(&actions.haptic_set));
-            self.legacy_state.on_action_sync();
         }
 
-        {
-            tracy_span!("xrSyncActions");
-            data.session.sync_actions(&sync_sets).unwrap();
+        if self.sync_actions(&data, &sync_sets).is_err() {
+            return vr::EVRInputError::IPCError;
         }
+        self.legacy_state.on_action_sync();
 
         let devices = data.input_data.devices.read().unwrap();
         let left_profile = devices
@@ -1193,6 +1202,9 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
     }
 
     fn SetActionManifestPath(&self, path: *const c_char) -> vr::EVRInputError {
+        if self.openxr.is_runtime_lost() {
+            return vr::EVRInputError::IPCError;
+        }
         if path.is_null() {
             return vr::EVRInputError::InvalidParam;
         }
@@ -1202,11 +1214,22 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
 
         // We need to restart the session if the legacy actions have already been attached.
         self.loading_actions.store(true, Ordering::Relaxed);
-        let mut data = self.openxr.session_data.get();
+        let Ok(mut data) = self.openxr.session_data.get() else {
+            self.loading_actions.store(false, Ordering::Relaxed);
+            return vr::EVRInputError::IPCError;
+        };
         if data.input_data.get_legacy_actions().is_some() {
             drop(data);
-            self.openxr.restart_session();
-            data = self.openxr.session_data.get();
+            if let Err(error) = self.openxr.restart_session() {
+                debug!("OpenXR session restart failed: {error:?}");
+                self.loading_actions.store(false, Ordering::Relaxed);
+                return vr::EVRInputError::IPCError;
+            }
+            let Ok(restarted_session) = self.openxr.session_data.get() else {
+                self.loading_actions.store(false, Ordering::Relaxed);
+                return vr::EVRInputError::IPCError;
+            };
+            data = restarted_session;
         }
 
         let ret = match self.load_action_manifest(&data, path) {
@@ -1347,7 +1370,7 @@ impl<C: openxr_data::Compositor> vr::IVRInput004On005 for Input<C> {
 }
 
 impl<C: openxr_data::Compositor> Input<C> {
-    pub fn interaction_profile_changed(&self, session_data: &SessionData) {
+    pub fn interaction_profile_changed(&self, session_data: &SessionData) -> xr::Result<()> {
         let mut devices = session_data.input_data.devices.write().unwrap();
 
         let mut devices_to_create = vec![];
@@ -1358,8 +1381,7 @@ impl<C: openxr_data::Compositor> Input<C> {
 
             let profile_path = session_data
                 .session
-                .current_interaction_profile(subaction_path)
-                .unwrap();
+                .current_interaction_profile(subaction_path)?;
 
             if let Some(controller) = controller.as_mut() {
                 controller.profile_path = profile_path;
@@ -1376,7 +1398,7 @@ impl<C: openxr_data::Compositor> Input<C> {
                     if let Some(controller) = controller.as_mut() {
                         controller.connected = true;
                     }
-                    self.openxr.instance.path_to_string(path).unwrap()
+                    self.openxr.instance.path_to_string(path)?
                 }
             };
 
@@ -1439,8 +1461,7 @@ impl<C: openxr_data::Compositor> Input<C> {
                 "{} interaction profile changed: {}",
                 self.openxr
                     .instance
-                    .path_to_string(self.get_subaction_path(hand))
-                    .unwrap(),
+                    .path_to_string(self.get_subaction_path(hand))?,
                 profile_name
             )
         }
@@ -1455,14 +1476,24 @@ impl<C: openxr_data::Compositor> Input<C> {
         }
 
         #[cfg(feature = "monado")]
-        devices
-            .create_monado_generic_trackers(&self.openxr, session_data)
-            .unwrap();
+        devices.create_monado_generic_trackers(&self.openxr, session_data)?;
+        Ok(())
     }
 
-    pub fn frame_start_update(&self) {
+    fn sync_actions(
+        &self,
+        data: &SessionData,
+        action_sets: &[xr::ActiveActionSet],
+    ) -> xr::Result<()> {
+        tracy_span!("xrSyncActions");
+        self.openxr
+            .check_xr("action sync", data.session.sync_actions(action_sets))
+            .map(|_| ())
+    }
+
+    pub fn frame_start_update(&self) -> xr::Result<()> {
         tracy_span!();
-        let data = self.openxr.session_data.get();
+        let data = self.openxr.session_data.get()?;
         let devices = data.input_data.devices.read().unwrap();
 
         for device in devices.iter() {
@@ -1483,27 +1514,25 @@ impl<C: openxr_data::Compositor> Input<C> {
                 && (right_hand.is_none_or(|hand| !hand.connected))
             {
                 debug!("no controllers connected - syncing info set");
-                data.session
-                    .sync_actions(&[xr::ActiveActionSet::new(&loaded.info_set)])
-                    .unwrap();
+                return self.sync_actions(&data, &[xr::ActiveActionSet::new(&loaded.info_set)]);
             }
-            return;
+            return Ok(());
         }
 
         match input_data.get_legacy_actions() {
             Some(actions) => {
-                data.session
-                    .sync_actions(&[
+                self.sync_actions(
+                    &data,
+                    &[
                         xr::ActiveActionSet::new(&actions.set),
                         xr::ActiveActionSet::new(&input_data.pose_data.get().unwrap().set),
-                    ])
-                    .unwrap();
-
+                    ],
+                )?;
                 self.legacy_state.on_action_sync();
             }
             None => {
                 if self.loading_actions.load(Ordering::Relaxed) {
-                    return;
+                    return Ok(());
                 }
 
                 // If we haven't created our legacy actions yet but we're getting our per frame
@@ -1523,11 +1552,12 @@ impl<C: openxr_data::Compositor> Input<C> {
                     debug!(
                         "Couldn't set up legacy actions because we're not in the real session yet."
                     );
-                    return;
+                    return Ok(());
                 }
                 self.setup_legacy_actions();
             }
         }
+        Ok(())
     }
 
     pub fn post_session_restart(&self, data: &SessionData) {
@@ -1552,7 +1582,9 @@ impl<C: openxr_data::Compositor> Input<C> {
             warn!("{FUNC}: Got null event pointer.");
             return false;
         }
-        let data = self.openxr.session_data.get();
+        let Ok(data) = self.openxr.session_data.get() else {
+            return false;
+        };
         let mut devices = data.input_data.devices.write().unwrap();
 
         for (i, device) in devices.iter_mut().enumerate() {

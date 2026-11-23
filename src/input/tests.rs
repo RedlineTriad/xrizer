@@ -248,14 +248,14 @@ impl Fixture {
             vr::EVRInputError::None
         );
         if self.pending_profile_change {
-            self.input.openxr.poll_events();
+            self.input.openxr.poll_events().unwrap();
             self.pending_profile_change = false;
         }
     }
 
     #[track_caller]
     pub fn get_action<T: ActionType>(&self, handle: vr::VRActionHandle_t) -> xr::sys::Action {
-        let data = self.input.openxr.session_data.get();
+        let data = self.input.openxr.session_data.get().unwrap();
         let actions = data
             .input_data
             .get_loaded_actions()
@@ -277,7 +277,7 @@ impl Fixture {
         handle: vr::VRActionHandle_t,
         extra_action_type: ExtraActionType,
     ) -> Option<xr::sys::Action> {
-        let data = self.input.openxr.session_data.get();
+        let data = self.input.openxr.session_data.get().unwrap();
         let actions = data
             .input_data
             .get_loaded_actions()
@@ -299,7 +299,7 @@ impl Fixture {
         handle: vr::VRActionHandle_t,
         restrict: vr::VRInputValueHandle_t,
     ) -> Result<vr::InputPoseActionData_t, vr::EVRInputError> {
-        self.input.openxr.poll_events();
+        self.input.openxr.poll_events().unwrap();
         let mut state = Default::default();
         let err = self.input.GetPoseActionDataForNextFrame(
             handle,
@@ -357,8 +357,38 @@ impl Fixture {
     }
 
     pub fn raw_session(&self) -> xr::sys::Session {
-        self.input.openxr.session_data.get().session.as_raw()
+        self.input
+            .openxr
+            .session_data
+            .get()
+            .unwrap()
+            .session
+            .as_raw()
     }
+}
+
+#[test]
+fn action_sync_reports_runtime_loss() {
+    let f = Fixture::new();
+    f.load_actions(c"actions.json");
+    let mut active = vr::VRActiveActionSet_t {
+        ulActionSet: f.get_action_set_handle(c"/actions/set1"),
+        ..Default::default()
+    };
+    let session = f.input.openxr.session_data.get().unwrap().session.as_raw();
+    fakexr::fail_next_session_call(
+        session,
+        fakexr::SessionCall::SyncActions,
+        xr::sys::Result::ERROR_SESSION_LOST,
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            f.input
+                .UpdateActionState(&mut active, std::mem::size_of_val(&active) as u32, 1),
+            vr::EVRInputError::IPCError
+        );
+    }
+    assert!(f.input.openxr.is_runtime_lost());
 }
 
 #[test]
@@ -408,6 +438,7 @@ fn input_state_flow() {
             .openxr
             .session_data
             .get()
+            .unwrap()
             .input_data
             .get_legacy_actions()
             .is_none()
@@ -458,7 +489,7 @@ fn reload_manifest_on_session_restart() {
     let boolact = f.get_action_handle(c"/actions/set1/in/boolact");
 
     f.load_actions(c"actions.json");
-    f.input.openxr.restart_session();
+    f.input.openxr.restart_session().unwrap();
 
     fakexr::set_action_state(
         f.get_action::<bool>(boolact),
@@ -508,8 +539,8 @@ fn raw_pose_waitgetposes_and_skeletal_pose_identical() {
     f.set_interaction_profile::<Knuckles>(LeftHand);
 
     let frame = || {
-        f.input.openxr.poll_events();
-        f.input.frame_start_update();
+        f.input.openxr.poll_events().unwrap();
+        f.input.frame_start_update().unwrap();
     };
 
     // we need to wait two frames for the controller to be connected.
@@ -703,7 +734,7 @@ fn pose_action_no_restrict() {
     f.load_actions(c"actions.json");
     f.set_interaction_profile::<SimpleController>(LeftHand);
     f.set_interaction_profile::<SimpleController>(RightHand);
-    let session = f.input.openxr.session_data.get().session.as_raw();
+    let session = f.input.openxr.session_data.get().unwrap().session.as_raw();
     let pose_left = xr::Posef {
         position: xr::Vector3f {
             x: 0.5,
@@ -749,7 +780,7 @@ fn raw_pose_switch_profile() {
     f.load_actions(c"actions.json");
     f.set_interaction_profile::<SimpleController>(LeftHand);
     f.set_interaction_profile::<SimpleController>(RightHand);
-    let session = f.input.openxr.session_data.get().session.as_raw();
+    let session = f.input.openxr.session_data.get().unwrap().session.as_raw();
     let pose_left = xr::Posef {
         position: xr::Vector3f {
             x: 0.0,
@@ -807,8 +838,8 @@ fn raw_pose_switch_profile() {
     f.set_interaction_profile::<OculusTouch>(RightHand);
 
     // Cached poses don't reset until next frame
-    f.input.openxr.poll_events();
-    f.input.frame_start_update();
+    f.input.openxr.poll_events().unwrap();
+    f.input.frame_start_update().unwrap();
 
     f.sync(vr::VRActiveActionSet_t {
         ulActionSet: set1,
@@ -856,7 +887,7 @@ fn cased_actions() {
     );
 
     f.set_interaction_profile::<ViveWands>(LeftHand);
-    let session = f.input.openxr.session_data.get().session.as_raw();
+    let session = f.input.openxr.session_data.get().unwrap().session.as_raw();
     fakexr::set_grip(session, LeftHand, xr::Posef::IDENTITY);
     fakexr::set_aim(session, LeftHand, xr::Posef::IDENTITY);
     f.sync(vr::VRActiveActionSet_t {
@@ -1002,8 +1033,8 @@ fn detect_controller_after_manifest_load() {
 
     let input = f.input.clone();
     let frame = || {
-        input.openxr.poll_events();
-        input.frame_start_update();
+        input.openxr.poll_events().unwrap();
+        input.frame_start_update().unwrap();
     };
 
     frame();
@@ -1025,21 +1056,21 @@ fn empty_manifest() {
     f.input
         .SetActionManifestPath(c"empty_manifest.json".as_ptr() as _);
 
-    f.input.openxr.restart_session();
+    f.input.openxr.restart_session().unwrap();
     assert!(f.input.action_map.read().unwrap().is_empty());
 }
 
 #[test]
 fn load_actions_race() {
     let mut f = Fixture::new();
-    f.input.openxr.restart_session(); // get to real session
+    f.input.openxr.restart_session().unwrap(); // get to real session
 
     f.set_interaction_profile::<OculusTouch>(LeftHand);
     f.set_interaction_profile::<OculusTouch>(RightHand);
 
     let mut f = Arc::new(f);
-    f.input.frame_start_update(); // load legacy
-    f.input.openxr.poll_events();
+    f.input.frame_start_update().unwrap(); // load legacy
+    f.input.openxr.poll_events().unwrap();
     let got_input = f.input.get_legacy_controller_state(
         1,
         &mut vr::VRControllerState_t::default(),
@@ -1056,7 +1087,7 @@ fn load_actions_race() {
                 barrier.wait();
                 // arbitrary delay, so we get the frame start update right after restart
                 std::thread::sleep(std::time::Duration::from_micros(500));
-                input.frame_start_update();
+                input.frame_start_update().unwrap();
             });
         }
         {

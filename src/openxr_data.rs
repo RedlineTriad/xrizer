@@ -4,15 +4,15 @@ use crate::{
 };
 use derive_more::Deref;
 use glam::f32::{Quat, Vec3};
-use log::{info, warn};
+use log::{debug, info, warn};
 use openvr as vr;
 use openxr as xr;
-use std::mem::ManuallyDrop;
+use std::ops::Deref;
 use std::sync::{
-    RwLock,
-    atomic::{AtomicI64, Ordering},
+    RwLock, RwLockReadGuard,
+    atomic::{AtomicBool, AtomicI64, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "monado")]
 use openxr_mndx_xdev_space::XR_MNDX_XDEV_SPACE_EXTENSION_NAME;
@@ -23,7 +23,7 @@ pub trait Compositor: vr::InterfaceImpl {
         session: &SessionData,
         waiter: xr::FrameWaiter,
         stream: FrameStream,
-    );
+    ) -> xr::Result<()>;
 
     fn get_session_create_info(
         &self,
@@ -39,7 +39,7 @@ pub struct OpenXrData<C: Compositor> {
     _entry: xr::Entry,
     pub instance: xr::Instance,
     pub system_id: xr::SystemId,
-    pub session_data: SessionReadGuard,
+    pub session_data: SessionLock,
     pub display_time: AtomicXrTime,
     pub display_period_nanos: AtomicI64,
     pub enabled_extensions: xr::ExtensionSet,
@@ -51,8 +51,14 @@ pub struct OpenXrData<C: Compositor> {
 
 impl<C: Compositor> Drop for OpenXrData<C> {
     fn drop(&mut self) {
-        let mut data = unsafe { ManuallyDrop::take(&mut *self.session_data.0.get_mut().unwrap()) };
-        self.end_session(&mut data);
+        let session = self
+            .session_data
+            .data
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(mut data) = session.take() {
+            let _ = self.end_session(&mut data);
+        }
     }
 }
 
@@ -172,15 +178,18 @@ impl<C: Compositor> OpenXrData<C> {
             .system(xr::FormFactor::HEAD_MOUNTED_DISPLAY)
             .map_err(InitError::SystemCreationFailed)?;
 
-        let session_data = SessionReadGuard(RwLock::new(ManuallyDrop::new(
-            SessionData::new(
-                &instance,
-                system_id,
-                vr::ETrackingUniverseOrigin::Standing,
-                None,
-            )?
-            .0,
-        )));
+        let session_data = SessionLock {
+            data: RwLock::new(Some(
+                SessionData::new(
+                    &instance,
+                    system_id,
+                    vr::ETrackingUniverseOrigin::Standing,
+                    None,
+                )?
+                .0,
+            )),
+            runtime_lost: AtomicBool::new(false),
+        };
 
         let display_time = if exts.khr_convert_timespec_time {
             instance.now().map(|t| t.as_nanos()).unwrap_or(1i64)
@@ -201,26 +210,62 @@ impl<C: Compositor> OpenXrData<C> {
         })
     }
 
-    pub fn poll_events(&self) {
-        let data = self.session_data.get();
-        if let Some(state) = self.poll_events_impl(&data) {
-            drop(data);
-            self.session_data.0.write().unwrap().state = state;
-        }
+    pub(crate) fn is_runtime_lost(&self) -> bool {
+        self.session_data.runtime_lost.load(Ordering::Relaxed)
     }
 
-    fn poll_events_impl(&self, session_data: &SessionData) -> Option<xr::SessionState> {
+    pub(crate) fn check_xr<T>(&self, operation: &str, result: xr::Result<T>) -> xr::Result<T> {
+        result.inspect_err(|error| {
+            if matches!(
+                *error,
+                xr::sys::Result::ERROR_SESSION_LOST | xr::sys::Result::ERROR_INSTANCE_LOST
+            ) {
+                if !self.session_data.runtime_lost.swap(true, Ordering::Relaxed) {
+                    warn!("OpenXR runtime lost during {operation}: {error}");
+                }
+            } else {
+                debug!("OpenXR {operation} failed: {error}");
+            }
+        })
+    }
+
+    pub fn poll_events(&self) -> xr::Result<()> {
+        let data = self.session_data.get()?;
+        let session = data.session.as_raw();
+        if let Some(state) = self.check_xr("event polling", self.poll_events_impl(&data))? {
+            drop(data);
+            let mut data = self.session_data.data.write().unwrap();
+            if let Some(data) = data.as_mut()
+                && data.session.as_raw() == session
+            {
+                data.state = state;
+            }
+        }
+        Ok(())
+    }
+
+    fn poll_events_impl(&self, session_data: &SessionData) -> xr::Result<Option<xr::SessionState>> {
         let mut buf = xr::EventDataBuffer::new();
         let mut state = None;
-        while let Some(event) = self.instance.poll_event(&mut buf).unwrap() {
+        while let Some(event) = self.instance.poll_event(&mut buf)? {
             match event {
                 xr::Event::SessionStateChanged(event) => {
-                    state = Some(event.state());
-                    info!("OpenXR session state changed: {:?}", event.state());
+                    if event.session() == session_data.session.as_raw() {
+                        state = Some(event.state());
+                        info!("OpenXR session state changed: {:?}", event.state());
+                        if event.state() == xr::SessionState::LOSS_PENDING {
+                            return Err(xr::sys::Result::ERROR_SESSION_LOST);
+                        }
+                    }
                 }
-                xr::Event::InteractionProfileChanged(_) => {
-                    if let Some(input) = self.input.get() {
-                        input.interaction_profile_changed(session_data);
+                xr::Event::InstanceLossPending(_) => {
+                    return Err(xr::sys::Result::ERROR_INSTANCE_LOST);
+                }
+                xr::Event::InteractionProfileChanged(event) => {
+                    if event.session() == session_data.session.as_raw()
+                        && let Some(input) = self.input.get()
+                    {
+                        input.interaction_profile_changed(session_data)?;
                     }
                 }
                 _ => {
@@ -229,48 +274,63 @@ impl<C: Compositor> OpenXrData<C> {
             }
         }
 
-        state
+        Ok(state)
     }
 
-    pub fn restart_session(&self) {
-        let mut session_guard = self.session_data.0.write().unwrap();
-        self.end_session(&mut session_guard);
+    pub fn restart_session(&self) -> Result<(), SessionRestartError> {
+        let mut session_guard = self.session_data.data.write().unwrap();
+        let old = session_guard
+            .as_mut()
+            .ok_or(SessionRestartError::NoSession)?;
+        self.end_session(old)
+            .map_err(SessionRestartError::Shutdown)?;
 
-        let origin = session_guard.current_origin;
+        let origin = old.current_origin;
         let comp = self
             .compositor
             .get()
             .expect("Session is being restarted, but compositor has not been set up!");
 
-        let info = comp.get_session_create_info(std::mem::take(&mut session_guard.comp_data));
+        let info = comp.get_session_create_info(std::mem::take(&mut old.comp_data));
 
-        // We need to destroy the old session before creating the new one.
-        let _ = unsafe { ManuallyDrop::take(&mut *session_guard) };
-
+        // Runtimes can require the old session to be destroyed before creating a new one.
+        drop(session_guard.take());
         let (session, waiter, stream) =
-            SessionData::new(&self.instance, self.system_id, origin, Some(&info))
-                .expect("Failed to initalize new session");
+            match SessionData::new(&self.instance, self.system_id, origin, Some(&info)) {
+                Ok(created) => created,
+                Err(error) => {
+                    let _ = self.check_xr::<()>("session creation", Err(error.xr_result()));
+                    return Err(SessionRestartError::Create(error));
+                }
+            };
 
-        comp.post_session_restart(&session, waiter, stream);
-
-        if let Some(input) = self.input.get() {
+        let result = comp.post_session_restart(&session, waiter, stream);
+        if !self.is_runtime_lost()
+            && let Some(input) = self.input.get()
+        {
             input.post_session_restart(&session);
         }
-
-        *session_guard = ManuallyDrop::new(session);
+        *session_guard = Some(session);
+        result.map_err(SessionRestartError::RestoreFrame)
     }
 
     pub fn set_tracking_space(&self, space: vr::ETrackingUniverseOrigin) {
-        self.session_data.0.write().unwrap().current_origin = space;
+        if let Some(data) = self.session_data.data.write().unwrap().as_mut() {
+            data.current_origin = space;
+        }
     }
 
     pub fn get_tracking_space(&self) -> vr::ETrackingUniverseOrigin {
-        self.session_data.get().current_origin
+        self.session_data
+            .get()
+            .map_or(vr::ETrackingUniverseOrigin::Standing, |data| {
+                data.current_origin
+            })
     }
 
     pub fn reset_tracking_space(&self, origin: vr::ETrackingUniverseOrigin) {
-        let mut guard = self.session_data.0.write().unwrap();
-        let SessionData {
+        let mut guard = self.session_data.data.write().unwrap();
+        let Some(SessionData {
             session,
             view_space,
             local_space_reference,
@@ -278,7 +338,10 @@ impl<C: Compositor> OpenXrData<C> {
             stage_space_reference,
             stage_space_adjusted,
             ..
-        } = &mut **guard;
+        }) = guard.as_mut().filter(|_| !self.is_runtime_lost())
+        else {
+            return;
+        };
 
         let reset_space = |ref_space, adjusted_space: &mut xr::Space, ty| {
             let xr::Posef {
@@ -348,28 +411,55 @@ impl<C: Compositor> OpenXrData<C> {
 
         self.session_data
             .get()
-            .session
-            .get_display_refresh_rate()
+            .and_then(|data| data.session.get_display_refresh_rate())
             .unwrap_or_else(|_| get_fallback_rate())
     }
 
-    fn end_session(&self, session_data: &mut SessionData) {
-        session_data.session.request_exit().unwrap();
-        let mut state = session_data.state;
-        while state != xr::SessionState::STOPPING {
-            if let Some(s) = self.poll_events_impl(session_data) {
-                state = s;
-            }
+    fn end_session(&self, session_data: &mut SessionData) -> Result<(), SessionShutdownError> {
+        if self.is_runtime_lost() {
+            return Err(SessionShutdownError::RuntimeLost);
+        }
+        if session_data.state == xr::SessionState::EXITING {
+            return Err(SessionShutdownError::Exiting);
+        }
+        if session_data.state != xr::SessionState::STOPPING {
+            self.check_xr("request exit", session_data.session.request_exit())
+                .map_err(SessionShutdownError::OpenXr)?;
+            self.wait_for_session_state(session_data, xr::SessionState::STOPPING)?;
         }
         #[cfg(test)]
         if let Some(comp) = self.compositor.get() {
             comp.on_restart();
         }
-        session_data.session.end().unwrap();
-        while state != xr::SessionState::EXITING {
-            if let Some(s) = self.poll_events_impl(session_data) {
-                state = s;
+        self.check_xr("end session", session_data.session.end())
+            .map_err(SessionShutdownError::OpenXr)?;
+        self.wait_for_session_state(session_data, xr::SessionState::EXITING)
+    }
+
+    fn wait_for_session_state(
+        &self,
+        session_data: &mut SessionData,
+        target: xr::SessionState,
+    ) -> Result<(), SessionShutdownError> {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Some(state) = self
+                .check_xr("event polling", self.poll_events_impl(session_data))
+                .map_err(SessionShutdownError::OpenXr)?
+            {
+                session_data.state = state;
             }
+            if session_data.state == target {
+                return Ok(());
+            }
+            if session_data.state == xr::SessionState::EXITING {
+                return Err(SessionShutdownError::Exiting);
+            }
+            if Instant::now() >= deadline {
+                warn!("Timed out waiting for OpenXR session state {target:?}");
+                return Err(SessionShutdownError::Timeout(target));
+            }
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 }
@@ -388,11 +478,50 @@ impl AtomicXrTime {
     }
 }
 
-pub struct SessionReadGuard(RwLock<ManuallyDrop<SessionData>>);
-impl SessionReadGuard {
-    pub fn get(&self) -> std::sync::RwLockReadGuard<'_, ManuallyDrop<SessionData>> {
-        self.0.read().unwrap()
+pub struct SessionLock {
+    data: RwLock<Option<SessionData>>,
+    runtime_lost: AtomicBool,
+}
+
+impl SessionLock {
+    pub fn get(&self) -> xr::Result<SessionReadGuard<'_>> {
+        let data = self.data.read().unwrap();
+        if self.runtime_lost.load(Ordering::Relaxed) || data.is_none() {
+            return Err(xr::sys::Result::ERROR_SESSION_LOST);
+        }
+        Ok(SessionReadGuard(data))
     }
+}
+
+pub struct SessionReadGuard<'a>(RwLockReadGuard<'a, Option<SessionData>>);
+
+impl Deref for SessionReadGuard<'_> {
+    type Target = SessionData;
+
+    fn deref(&self) -> &SessionData {
+        self.0.as_ref().unwrap()
+    }
+}
+
+#[derive(Debug)]
+#[allow(dead_code)] // Error details are logged with Debug.
+pub enum SessionRestartError {
+    NoSession,
+    /// The previous session is still stored.
+    Shutdown(SessionShutdownError),
+    /// The previous session was destroyed and no replacement was installed.
+    Create(SessionCreationError),
+    /// The replacement session was installed before reporting the frame error.
+    RestoreFrame(xr::sys::Result),
+}
+
+#[derive(Debug)]
+#[allow(dead_code)] // Error details are logged with Debug.
+pub enum SessionShutdownError {
+    RuntimeLost,
+    Exiting,
+    Timeout(xr::SessionState),
+    OpenXr(xr::sys::Result),
 }
 
 pub struct Session<G: xr::Graphics> {
@@ -461,9 +590,23 @@ pub struct SessionData {
 #[allow(dead_code)] // Results aren't used, but they're printed
 #[allow(clippy::enum_variant_names)]
 pub enum SessionCreationError {
+    GraphicsSetupFailed(xr::sys::Result),
     SessionCreationFailed(xr::sys::Result),
+    ReferenceSpaceCreationFailed(xr::sys::Result),
     PollEventFailed(xr::sys::Result),
     BeginSessionFailed(xr::sys::Result),
+}
+
+impl SessionCreationError {
+    fn xr_result(&self) -> xr::sys::Result {
+        match *self {
+            Self::GraphicsSetupFailed(error)
+            | Self::SessionCreationFailed(error)
+            | Self::ReferenceSpaceCreationFailed(error)
+            | Self::PollEventFailed(error)
+            | Self::BeginSessionFailed(error) => error,
+        }
+    }
 }
 
 impl SessionData {
@@ -477,8 +620,8 @@ impl SessionData {
         let (temp_vulkan, info) = if let Some(info) = create_info {
             if let SessionCreateInfo::Vulkan(info) = info {
                 // Monado seems to (incorrectly) give validation errors unless we call this.
-                let pd =
-                    unsafe { instance.vulkan_graphics_device(system_id, info.instance) }.unwrap();
+                let pd = unsafe { instance.vulkan_graphics_device(system_id, info.instance) }
+                    .map_err(SessionCreationError::GraphicsSetupFailed)?;
                 assert_eq!(pd, info.physical_device);
             }
             (None, info)
@@ -508,23 +651,19 @@ impl SessionData {
                 std::any::type_name::<G>()
             );
             // required to call
-            let _ = instance.graphics_requirements::<G>(system_id).unwrap();
-
-            unsafe { instance.create_session(system_id, &info.0) }.map(|(session, w, s)| {
-                let swapchain_formats = session
-                    .enumerate_swapchain_formats()
-                    .expect("Couldn't enumerate session swapchain formats!");
-                (
-                    session.clone().into_any_graphics(),
-                    Session {
-                        session,
-                        swapchain_formats,
-                    }
-                    .into(),
-                    w,
-                    s.into(),
-                )
-            })
+            instance.graphics_requirements::<G>(system_id)?;
+            let (session, waiter, stream) = unsafe { instance.create_session(system_id, &info.0) }?;
+            let swapchain_formats = session.enumerate_swapchain_formats()?;
+            Ok((
+                session.clone().into_any_graphics(),
+                Session {
+                    session,
+                    swapchain_formats,
+                }
+                .into(),
+                waiter,
+                stream.into(),
+            ))
         }
 
         let (session, session_graphics, waiter, stream) = info
@@ -532,28 +671,48 @@ impl SessionData {
             .map_err(SessionCreationError::SessionCreationFailed)?;
 
         info!("New session created!");
-        let view_space = session
-            .create_reference_space(xr::ReferenceSpaceType::VIEW, xr::Posef::IDENTITY)
-            .unwrap();
-        let [local_space_reference, local_space_adjusted] = std::array::from_fn(|_| {
+        let create_space = |ty| {
             session
-                .create_reference_space(xr::ReferenceSpaceType::LOCAL, xr::Posef::IDENTITY)
-                .unwrap()
-        });
-        let [stage_space_reference, stage_space_adjusted] = std::array::from_fn(|_| {
-            session
-                .create_reference_space(xr::ReferenceSpaceType::STAGE, xr::Posef::IDENTITY)
-                .unwrap()
-        });
+                .create_reference_space(ty, xr::Posef::IDENTITY)
+                .map_err(SessionCreationError::ReferenceSpaceCreationFailed)
+        };
+        let view_space = create_space(xr::ReferenceSpaceType::VIEW)?;
+        let local_space_reference = create_space(xr::ReferenceSpaceType::LOCAL)?;
+        let local_space_adjusted = create_space(xr::ReferenceSpaceType::LOCAL)?;
+        let stage_space_reference = create_space(xr::ReferenceSpaceType::STAGE)?;
+        let stage_space_adjusted = create_space(xr::ReferenceSpaceType::STAGE)?;
 
         let mut buf = xr::EventDataBuffer::new();
         loop {
-            if let Some(xr::Event::SessionStateChanged(state)) = instance
+            match instance
                 .poll_event(&mut buf)
                 .map_err(SessionCreationError::PollEventFailed)?
-                && state.state() == xr::SessionState::READY
             {
-                break;
+                Some(xr::Event::SessionStateChanged(state))
+                    if state.session() == session.as_raw() =>
+                {
+                    match state.state() {
+                        xr::SessionState::READY => break,
+                        xr::SessionState::LOSS_PENDING => {
+                            return Err(SessionCreationError::PollEventFailed(
+                                xr::sys::Result::ERROR_SESSION_LOST,
+                            ));
+                        }
+                        xr::SessionState::EXITING => {
+                            return Err(SessionCreationError::PollEventFailed(
+                                xr::sys::Result::ERROR_SESSION_NOT_RUNNING,
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                Some(xr::Event::InstanceLossPending(_)) => {
+                    return Err(SessionCreationError::PollEventFailed(
+                        xr::sys::Result::ERROR_INSTANCE_LOST,
+                    ));
+                }
+                Some(_) => {}
+                None => std::thread::sleep(Duration::from_millis(1)),
             }
         }
 
@@ -765,6 +924,7 @@ mod tests {
         backend: crate::graphics_backends::VulkanData,
         barrier: Mutex<Option<Arc<Barrier>>>,
         restart_complete: AtomicBool,
+        restart_error: Option<xr::sys::Result>,
     }
     impl FakeCompositor {
         pub fn new(xr: &OpenXrData<Self>) -> Self {
@@ -779,6 +939,7 @@ mod tests {
                 ),
                 barrier: barrier.into(),
                 restart_complete: false.into(),
+                restart_error: None,
             }
         }
     }
@@ -803,8 +964,9 @@ mod tests {
             _: &crate::openxr_data::SessionData,
             _: openxr::FrameWaiter,
             _: FrameStream,
-        ) {
+        ) -> xr::Result<()> {
             self.restart_complete.store(true, Ordering::Relaxed);
+            self.restart_error.map_or(Ok(()), Err)
         }
 
         fn on_restart(&self) {
@@ -812,6 +974,60 @@ mod tests {
                 barrier.wait();
             }
         }
+    }
+
+    #[test]
+    fn shutdown_handles_first_loss_in_request_exit() {
+        let data = OpenXrData::<FakeCompositor>::new(&Injector::default()).unwrap();
+        let session = data.session_data.get().unwrap().session.as_raw();
+        let called = fakexr::fail_next_session_call(
+            session,
+            fakexr::SessionCall::RequestExit,
+            xr::sys::Result::ERROR_INSTANCE_LOST,
+        );
+        drop(data);
+        assert!(called.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn restart_reports_shutdown_error_and_keeps_the_old_session() {
+        use super::{SessionRestartError, SessionShutdownError};
+
+        let data = OpenXrData::<FakeCompositor>::new(&Injector::default()).unwrap();
+        let session = data.session_data.get().unwrap().session.as_raw();
+        fakexr::fail_next_session_call(
+            session,
+            fakexr::SessionCall::RequestExit,
+            xr::sys::Result::ERROR_RUNTIME_FAILURE,
+        );
+
+        assert!(matches!(
+            data.restart_session(),
+            Err(SessionRestartError::Shutdown(SessionShutdownError::OpenXr(
+                xr::sys::Result::ERROR_RUNTIME_FAILURE
+            )))
+        ));
+        assert_eq!(data.session_data.get().unwrap().session.as_raw(), session);
+    }
+
+    #[test]
+    fn frame_restoration_failure_keeps_the_new_session() {
+        let data = OpenXrData::<FakeCompositor>::new(&Injector::default()).unwrap();
+        let old = data.session_data.get().unwrap().session.as_raw();
+        let comp = Arc::new(FakeCompositor {
+            restart_error: Some(xr::sys::Result::ERROR_RUNTIME_FAILURE),
+            ..FakeCompositor::new(&data)
+        });
+        data.compositor.set(Arc::downgrade(&comp));
+
+        assert!(matches!(
+            data.restart_session(),
+            Err(super::SessionRestartError::RestoreFrame(
+                xr::sys::Result::ERROR_RUNTIME_FAILURE
+            ))
+        ));
+        assert_ne!(data.session_data.get().unwrap().session.as_raw(), old);
+        drop(data); // Session must be dropped before Vulkan data.
     }
 
     #[test]
@@ -832,14 +1048,14 @@ mod tests {
                 let comp = comp.clone();
                 scope.spawn(move || {
                     barrier.wait();
-                    let _unused = data.session_data.get();
+                    let _unused = data.session_data.get().unwrap();
                     log::debug!("acquired");
                     assert!(comp.restart_complete.load(Ordering::Relaxed));
                 });
             }
 
             scope.spawn(|| {
-                data.restart_session();
+                data.restart_session().unwrap();
             });
         });
 
