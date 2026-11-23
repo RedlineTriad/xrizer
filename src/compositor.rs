@@ -99,55 +99,144 @@ impl Compositor {
         }
     }
 
-    fn maybe_wait_frame(&self, session_data: &SessionData) {
+    fn maybe_wait_frame(&self, session_data: &SessionData) -> xr::Result<()> {
         tracy_span!();
         let mut frame_lock = { session_data.comp_data.0.lock().unwrap() };
-        self.frame_state
-            .lock()
-            .unwrap()
-            .advance_to(FrameState::Waited);
-        let Some(ctrl) = frame_lock.as_mut() else {
-            debug!("no frame controller - not starting frame");
-            return;
-        };
 
         #[macros::any_graphics(DynFrameController)]
         fn wait_frame<G: GraphicsBackend + 'static>(
             ctrl: &mut FrameController<G>,
-        ) -> (xr::Time, i64) {
+        ) -> xr::Result<(xr::Time, i64)> {
             ctrl.wait_frame()
         }
 
-        let (display_time, display_period) = ctrl.with_any_graphics_mut::<wait_frame>(());
-        self.openxr.display_time.set(display_time);
-        self.openxr
-            .display_period_nanos
-            .store(display_period, Ordering::Relaxed);
-    }
-
-    fn maybe_begin_frame(&self, session_data: &SessionData) {
-        tracy_span!();
-        let mut frame_lock = { session_data.comp_data.0.lock().unwrap() };
-        if !self
-            .frame_state
+        if let Some(ctrl) = frame_lock.as_mut() {
+            let (display_time, display_period) = self
+                .openxr
+                .check_xr("frame wait", ctrl.with_any_graphics_mut::<wait_frame>(()))?;
+            self.openxr.display_time.set(display_time);
+            self.openxr
+                .display_period_nanos
+                .store(display_period, Ordering::Relaxed);
+        } else {
+            debug!("no frame controller - not starting frame");
+        }
+        self.frame_state
             .lock()
             .unwrap()
-            .advance_to(FrameState::Begun)
-        {
+            .advance_to(FrameState::Waited);
+        Ok(())
+    }
+
+    fn maybe_begin_frame(&self, session_data: &SessionData) -> xr::Result<()> {
+        tracy_span!();
+        let mut frame_lock = session_data.comp_data.0.lock().unwrap();
+        let mut state = self.frame_state.lock().unwrap();
+        if *state != FrameState::Waited {
             debug!("not starting frame - already begun or submitted");
-            return;
-        };
-        let Some(ctrl) = frame_lock.as_mut() else {
-            debug!("no frame controller - not starting frame");
-            return;
-        };
+            return Ok(());
+        }
 
         #[macros::any_graphics(DynFrameController)]
-        fn begin_frame<G: GraphicsBackend + 'static>(ctrl: &mut FrameController<G>) {
+        fn begin_frame<G: GraphicsBackend + 'static>(
+            ctrl: &mut FrameController<G>,
+        ) -> xr::Result<()> {
             ctrl.begin_frame()
         }
 
-        ctrl.with_any_graphics_mut::<begin_frame>(());
+        if let Some(ctrl) = frame_lock.as_mut() {
+            self.openxr
+                .check_xr("frame begin", ctrl.with_any_graphics_mut::<begin_frame>(()))?;
+        }
+        state.advance_to(FrameState::Begun);
+        Ok(())
+    }
+
+    fn present_frame(&self, session_data: &SessionData) -> xr::Result<()> {
+        #[macros::any_graphics(DynFrameController)]
+        fn end_frame<G: GraphicsBackend + 'static>(
+            ctrl: &mut FrameController<G>,
+            session_data: &SessionData,
+            system: &System,
+            display_time: xr::Time,
+            overlays: Option<&OverlayMan>,
+        ) -> xr::Result<()>
+        where
+            for<'b> &'b crate::overlay::AnySwapchainMap:
+                TryInto<&'b crate::overlay::SwapchainMap<G::Api>, Error: std::fmt::Display>,
+        {
+            ctrl.end_frame(session_data, system, display_time, overlays)
+        }
+
+        let mut frame_lock = session_data.comp_data.0.lock().unwrap();
+        let Some(ctrl) = frame_lock.as_mut() else {
+            debug!("no frame controller - not presenting frame");
+            return Ok(());
+        };
+
+        if *self.frame_state.lock().unwrap() != FrameState::Begun {
+            return Ok(());
+        }
+
+        trace!("presenting frame");
+        let system = self.system.force(|i| System::new(self.openxr.clone(), i));
+        let display_time = self.openxr.display_time.get();
+        let overlays = self.overlays.get();
+
+        let result = ctrl.with_any_graphics_mut::<end_frame>((
+            session_data,
+            &system,
+            display_time,
+            overlays.as_deref(),
+        ));
+        self.openxr.check_xr("frame end", result)?;
+
+        self.frame_state
+            .lock()
+            .unwrap()
+            .advance_to(FrameState::Submitted);
+
+        self.metrics.index.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .time
+            .store(self.metrics.system_start.elapsed().as_secs_f64());
+        #[cfg(feature = "tracing")]
+        {
+            tracy_client::frame_mark();
+        }
+        Ok(())
+    }
+
+    fn update_frame_and_input(&self) -> xr::Result<()> {
+        self.openxr.poll_events()?;
+        self.focused.call_once(|| {});
+        {
+            let session_data = self.openxr.session_data.get();
+            let timing_mode = *self.timing_mode.lock().unwrap();
+            if matches!(
+                timing_mode,
+                vr::EVRCompositorTimingMode::Implicit
+                    | vr::EVRCompositorTimingMode::Explicit_RuntimePerformsPostPresentHandoff
+            ) {
+                self.present_frame(&session_data)?;
+            }
+
+            let state = *self.frame_state.lock().unwrap();
+            if state == FrameState::Waited {
+                self.maybe_begin_frame(&session_data)?;
+            }
+            self.maybe_wait_frame(&session_data)?;
+            if timing_mode == vr::EVRCompositorTimingMode::Implicit {
+                self.maybe_begin_frame(&session_data)?;
+            }
+        }
+        if let Some(system) = self.system.get() {
+            system.reset_views()?;
+        }
+        if let Some(input) = self.input.get() {
+            input.frame_start_update();
+        }
+        Ok(())
     }
 
     pub fn initialize_real_session(
@@ -254,7 +343,7 @@ impl openxr_data::Compositor for Compositor {
         session_data: &SessionData,
         waiter: xr::FrameWaiter,
         stream: FrameStream,
-    ) {
+    ) -> xr::Result<()> {
         // This function is called while a write lock is called on the session, and as such should
         // not use self.openxr.session_data.get().
 
@@ -304,11 +393,11 @@ impl openxr_data::Compositor for Compositor {
 
         trace!("returning to {old_state:?} frame state");
         match old_state {
-            FrameState::Submitted => {}
+            FrameState::Submitted => Ok(()),
             FrameState::Waited => self.maybe_wait_frame(session_data),
             FrameState::Begun => {
-                self.maybe_wait_frame(session_data);
-                self.maybe_begin_frame(session_data);
+                self.maybe_wait_frame(session_data)?;
+                self.maybe_begin_frame(session_data)
             }
         }
     }
@@ -373,8 +462,11 @@ impl vr::IVRCompositor029_Interface for Compositor {
         }
 
         let session_data = self.openxr.session_data.get();
-        self.maybe_begin_frame(&session_data);
-        vr::EVRCompositorError::None
+        if self.maybe_begin_frame(&session_data).is_ok() {
+            vr::EVRCompositorError::None
+        } else {
+            vr::EVRCompositorError::RequestFailed
+        }
     }
     fn SetExplicitTimingMode(&self, timing_mode: vr::EVRCompositorTimingMode) {
         debug!("Setting timing mode to {timing_mode:?}");
@@ -659,59 +751,8 @@ impl vr::IVRCompositor029_Interface for Compositor {
         true
     }
     fn PostPresentHandoff(&self) {
-        if self.openxr.is_runtime_lost() {
-            return;
-        }
-
-        #[macros::any_graphics(DynFrameController)]
-        fn end_frame<G: GraphicsBackend + 'static>(
-            ctrl: &mut FrameController<G>,
-            session_data: &SessionData,
-            system: &System,
-            display_time: xr::Time,
-            overlays: Option<&OverlayMan>,
-        ) where
-            for<'b> &'b crate::overlay::AnySwapchainMap:
-                TryInto<&'b crate::overlay::SwapchainMap<G::Api>, Error: std::fmt::Display>,
-        {
-            ctrl.end_frame(session_data, system, display_time, overlays)
-        }
-
-        let session_data = self.openxr.session_data.get();
-        let mut frame_lock = session_data.comp_data.0.lock().unwrap();
-        let Some(ctrl) = frame_lock.as_mut() else {
-            debug!("no frame controller - not presenting frame");
-            return;
-        };
-
-        if *self.frame_state.lock().unwrap() != FrameState::Begun {
-            return;
-        }
-
-        trace!("presenting frame");
-        let system = self.system.force(|i| System::new(self.openxr.clone(), i));
-        let display_time = self.openxr.display_time.get();
-        let overlays = self.overlays.get();
-
-        ctrl.with_any_graphics_mut::<end_frame>((
-            &session_data,
-            &system,
-            display_time,
-            overlays.as_deref(),
-        ));
-
-        self.frame_state
-            .lock()
-            .unwrap()
-            .advance_to(FrameState::Submitted);
-
-        self.metrics.index.fetch_add(1, Ordering::Relaxed);
-        self.metrics
-            .time
-            .store(self.metrics.system_start.elapsed().as_secs_f64());
-        #[cfg(feature = "tracing")]
-        {
-            tracy_client::frame_mark();
+        if !self.openxr.is_runtime_lost() {
+            let _ = self.present_frame(&self.openxr.session_data.get());
         }
     }
     fn ClearLastSubmittedFrame(&self) {
@@ -906,40 +947,10 @@ impl vr::IVRCompositor029_Interface for Compositor {
         game_pose_count: u32,
     ) -> vr::EVRCompositorError {
         tracy_span!("WaitGetPoses impl");
-        // This should be called every frame - we must regularly poll events.
-        if self.openxr.is_runtime_lost() || self.openxr.poll_events().is_err() {
+        if self.openxr.is_runtime_lost() || self.update_frame_and_input().is_err() {
             clear_poses(render_pose_array, render_pose_count);
             clear_poses(game_pose_array, game_pose_count);
             return vr::EVRCompositorError::RequestFailed;
-        }
-        self.focused.call_once(|| {});
-        {
-            let session_data = self.openxr.session_data.get();
-            let timing_mode = *self.timing_mode.lock().unwrap();
-            if matches!(
-                timing_mode,
-                vr::EVRCompositorTimingMode::Implicit
-                    | vr::EVRCompositorTimingMode::Explicit_RuntimePerformsPostPresentHandoff
-            ) && *self.frame_state.lock().unwrap() == FrameState::Begun
-            {
-                self.PostPresentHandoff();
-            }
-
-            if *self.frame_state.lock().unwrap() == FrameState::Waited {
-                // discard frame
-                self.maybe_begin_frame(&session_data);
-            }
-            self.maybe_wait_frame(&session_data);
-
-            if timing_mode == vr::EVRCompositorTimingMode::Implicit {
-                self.maybe_begin_frame(&session_data);
-            }
-        }
-        if let Some(system) = self.system.get() {
-            system.reset_views();
-        }
-        if let Some(input) = self.input.get() {
-            input.frame_start_update();
         }
 
         self.GetLastPoses(
@@ -1207,19 +1218,19 @@ impl<G: GraphicsBackend> FrameController<G> {
         self.image_acquired = true;
     }
 
-    fn wait_frame(&mut self) -> (xr::Time, i64) {
+    fn wait_frame(&mut self) -> xr::Result<(xr::Time, i64)> {
         let frame_state = {
             tracy_span!("wait frame");
-            self.waiter.wait().unwrap()
+            self.waiter.wait()?
         };
         self.should_render = frame_state.should_render && !self.app_suspend_render;
-        (
+        Ok((
             frame_state.predicted_display_time,
             frame_state.predicted_display_period.as_nanos(),
-        )
+        ))
     }
 
-    fn begin_frame(&mut self) {
+    fn begin_frame(&mut self) -> xr::Result<()> {
         if self.image_acquired {
             tracy_span!("release old swapchain image");
             self.swapchain_data
@@ -1228,6 +1239,7 @@ impl<G: GraphicsBackend> FrameController<G> {
                 .swapchain
                 .release_image()
                 .unwrap();
+            self.image_acquired = false;
         }
 
         if self.swapchain_data.is_some() {
@@ -1236,11 +1248,12 @@ impl<G: GraphicsBackend> FrameController<G> {
 
         {
             tracy_span!("begin frame");
-            self.stream.begin().expect("Couldn't begin frame");
+            self.stream.begin()?;
         }
         self.eyes_submitted = [None; 2];
         self.submitting_null = false;
         trace!("frame begin");
+        Ok(())
     }
 
     fn submit_impl(
@@ -1325,7 +1338,8 @@ impl<G: GraphicsBackend> FrameController<G> {
         system: &System,
         display_time: xr::Time,
         overlays: Option<&OverlayMan>,
-    ) where
+    ) -> xr::Result<()>
+    where
         for<'b> &'b crate::overlay::AnySwapchainMap:
             TryInto<&'b crate::overlay::SwapchainMap<G::Api>, Error: std::fmt::Display>,
     {
@@ -1340,8 +1354,10 @@ impl<G: GraphicsBackend> FrameController<G> {
                 .as_ref()
                 .expect("Swapchain data unexpectedly invalid on submit");
 
-            let crate::system::ViewData { flags, views } =
-                system.get_views(session_data.current_origin_as_reference_space());
+            let crate::system::ViewData { flags, views } = system.try_get_views(
+                session_data,
+                session_data.current_origin_as_reference_space(),
+            )?;
             proj_layer_views = views
                 .into_iter()
                 .enumerate()
@@ -1406,10 +1422,10 @@ impl<G: GraphicsBackend> FrameController<G> {
         }
 
         self.stream
-            .end(display_time, xr::EnvironmentBlendMode::OPAQUE, &layers)
-            .unwrap();
+            .end(display_time, xr::EnvironmentBlendMode::OPAQUE, &layers)?;
 
         trace!("frame submitted");
+        Ok(())
     }
 }
 
@@ -1638,6 +1654,100 @@ mod tests {
             let session = self.comp.openxr.session_data.get().session.as_raw();
             assert_eq!(fakexr::session_frame_state(session), state);
         }
+    }
+
+    #[test]
+    fn frame_calls_report_runtime_loss() {
+        use fakexr::SessionCall;
+
+        for (call, error, state) in [
+            (
+                SessionCall::WaitFrame,
+                xr::sys::Result::ERROR_INSTANCE_LOST,
+                fakexr::FrameState::Ended,
+            ),
+            (
+                SessionCall::BeginFrame,
+                xr::sys::Result::ERROR_SESSION_LOST,
+                fakexr::FrameState::Waited,
+            ),
+            (
+                SessionCall::EndFrame,
+                xr::sys::Result::ERROR_SESSION_LOST,
+                fakexr::FrameState::Begun,
+            ),
+            (
+                SessionCall::LocateViews,
+                xr::sys::Result::ERROR_SESSION_LOST,
+                fakexr::FrameState::Begun,
+            ),
+        ] {
+            let f = Fixture::new();
+            f.ensure_real_session(false);
+            let session = f.comp.openxr.session_data.get().session.as_raw();
+            let called = fakexr::fail_next_session_call(session, call, error);
+            let mut render =
+                vr::space_relation_to_openvr_pose(Default::default(), Default::default());
+            render.bPoseIsValid = true;
+            let mut game = render;
+            assert_eq!(
+                f.comp.WaitGetPoses(&mut render, 1, &mut game, 1),
+                RequestFailed,
+                "loss during {call:?}"
+            );
+            assert!(called.load(Ordering::Relaxed));
+            assert!(!render.bPoseIsValid);
+            assert!(!game.bPoseIsValid);
+            assert_eq!(f.wait_get_poses(), RequestFailed);
+            assert_eq!(f.submit(vr::EVREye::Left), RequestFailed);
+            assert_eq!(f.comp.SubmitExplicitTimingData(), RequestFailed);
+            f.check_frame_state(state);
+
+            let request_exit = fakexr::fail_next_session_call(
+                session,
+                SessionCall::RequestExit,
+                xr::sys::Result::ERROR_SESSION_LOST,
+            );
+            assert!(f.comp.openxr.restart_session().is_err());
+            drop(f);
+            assert!(!request_exit.load(Ordering::Relaxed));
+        }
+    }
+
+    #[test]
+    fn explicit_timing_reports_begin_loss() {
+        let f = Fixture::new();
+        f.comp.SetExplicitTimingMode(
+            vr::EVRCompositorTimingMode::Explicit_ApplicationPerformsPostPresentHandoff,
+        );
+        f.ensure_real_session(true);
+        assert_eq!(f.wait_get_poses(), None);
+        let session = f.comp.openxr.session_data.get().session.as_raw();
+        fakexr::fail_next_session_call(
+            session,
+            fakexr::SessionCall::BeginFrame,
+            xr::sys::Result::ERROR_SESSION_LOST,
+        );
+        assert_eq!(f.comp.SubmitExplicitTimingData(), RequestFailed);
+        f.check_frame_state(fakexr::FrameState::Waited);
+        assert_eq!(f.wait_get_poses(), RequestFailed);
+    }
+
+    #[test]
+    fn transient_wait_failure_can_retry() {
+        let f = Fixture::new();
+        f.ensure_real_session(false);
+        let session = f.comp.openxr.session_data.get().session.as_raw();
+        fakexr::fail_next_session_call(
+            session,
+            fakexr::SessionCall::WaitFrame,
+            xr::sys::Result::ERROR_RUNTIME_FAILURE,
+        );
+        assert_eq!(f.wait_get_poses(), RequestFailed);
+        f.check_frame_state(fakexr::FrameState::Ended);
+        assert!(!f.comp.openxr.is_runtime_lost());
+        assert_eq!(f.wait_get_poses(), None);
+        f.check_frame_state(fakexr::FrameState::Begun);
     }
 
     #[test]

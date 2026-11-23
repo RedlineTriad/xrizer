@@ -166,6 +166,10 @@ pub fn session_frame_state(session: xr::Session) -> FrameState {
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum SessionCall {
+    WaitFrame,
+    BeginFrame,
+    EndFrame,
+    LocateViews,
     RequestExit,
 }
 
@@ -1736,6 +1740,9 @@ extern "system" fn wait_frame(
     state: *mut xr::FrameState,
 ) -> xr::Result {
     let session = get_handle!(session);
+    if let Some(error) = session.take_error(SessionCall::WaitFrame) {
+        return error;
+    }
     if let Err(e) = transition_frame_state(&session.frame_state, FrameState::Waited) {
         return e;
     }
@@ -1756,6 +1763,9 @@ extern "system" fn begin_frame(
     _info: *const xr::FrameBeginInfo,
 ) -> xr::Result {
     let session = get_handle!(session);
+    if let Some(error) = session.take_error(SessionCall::BeginFrame) {
+        return error;
+    }
     if let Err(e) = transition_frame_state(&session.frame_state, FrameState::Begun) {
         return e;
     }
@@ -1764,6 +1774,9 @@ extern "system" fn begin_frame(
 
 extern "system" fn end_frame(session: xr::Session, _info: *const xr::FrameEndInfo) -> xr::Result {
     let session = get_handle!(session);
+    if let Some(error) = session.take_error(SessionCall::EndFrame) {
+        return error;
+    }
     if let Err(e) = transition_frame_state(&session.frame_state, FrameState::Ended) {
         return e;
     }
@@ -1781,7 +1794,10 @@ extern "system" fn locate_views(
     output: *mut u32,
     views: *mut xr::View,
 ) -> xr::Result {
-    let _session = get_handle!(session);
+    let sess = get_handle!(session);
+    if let Some(error) = sess.take_error(SessionCall::LocateViews) {
+        return error;
+    }
     if !state.is_null() {
         unsafe {
             state.write(xr::ViewState {

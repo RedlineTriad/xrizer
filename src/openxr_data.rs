@@ -23,7 +23,7 @@ pub trait Compositor: vr::InterfaceImpl {
         session: &SessionData,
         waiter: xr::FrameWaiter,
         stream: FrameStream,
-    );
+    ) -> xr::Result<()>;
 
     fn get_session_create_info(
         &self,
@@ -288,7 +288,7 @@ impl<C: Compositor> OpenXrData<C> {
             SessionData::new(&self.instance, self.system_id, origin, Some(&info))
                 .expect("Failed to initalize new session");
 
-        comp.post_session_restart(&session, waiter, stream);
+        let restore_result = comp.post_session_restart(&session, waiter, stream);
 
         if !self.is_runtime_lost()
             && let Some(input) = self.input.get()
@@ -297,7 +297,7 @@ impl<C: Compositor> OpenXrData<C> {
         }
 
         *session_guard = ManuallyDrop::new(session);
-        Ok(())
+        restore_result.map_err(SessionRestartError::RestoreFrame)
     }
 
     pub fn set_tracking_space(&self, space: vr::ETrackingUniverseOrigin) {
@@ -468,6 +468,8 @@ impl SessionReadGuard {
 pub enum SessionRestartError {
     /// The previous session is still stored.
     Shutdown(SessionShutdownError),
+    /// The replacement session was installed before reporting the frame error.
+    RestoreFrame(xr::sys::Result),
 }
 
 #[derive(Debug)]
@@ -849,6 +851,7 @@ mod tests {
         backend: crate::graphics_backends::VulkanData,
         barrier: Mutex<Option<Arc<Barrier>>>,
         restart_complete: AtomicBool,
+        restart_error: Option<xr::sys::Result>,
     }
     impl FakeCompositor {
         pub fn new(xr: &OpenXrData<Self>) -> Self {
@@ -863,6 +866,7 @@ mod tests {
                 ),
                 barrier: barrier.into(),
                 restart_complete: false.into(),
+                restart_error: None,
             }
         }
     }
@@ -887,8 +891,9 @@ mod tests {
             _: &crate::openxr_data::SessionData,
             _: openxr::FrameWaiter,
             _: FrameStream,
-        ) {
+        ) -> xr::Result<()> {
             self.restart_complete.store(true, Ordering::Relaxed);
+            self.restart_error.map_or(Ok(()), Err)
         }
 
         fn on_restart(&self) {
@@ -930,6 +935,26 @@ mod tests {
             )))
         ));
         assert_eq!(data.session_data.get().session.as_raw(), session);
+    }
+
+    #[test]
+    fn frame_restoration_failure_keeps_the_new_session() {
+        let data = OpenXrData::<FakeCompositor>::new(&Injector::default()).unwrap();
+        let old = data.session_data.get().session.as_raw();
+        let comp = Arc::new(FakeCompositor {
+            restart_error: Some(xr::sys::Result::ERROR_RUNTIME_FAILURE),
+            ..FakeCompositor::new(&data)
+        });
+        data.compositor.set(Arc::downgrade(&comp));
+
+        assert!(matches!(
+            data.restart_session(),
+            Err(super::SessionRestartError::RestoreFrame(
+                xr::sys::Result::ERROR_RUNTIME_FAILURE
+            ))
+        ));
+        assert_ne!(data.session_data.get().session.as_raw(), old);
+        drop(data); // Session must be dropped before Vulkan data.
     }
 
     #[test]
